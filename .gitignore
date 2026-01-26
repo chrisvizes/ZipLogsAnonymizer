@@ -5,3 +5,5 @@ __pycache__
 test_*.zip
 test_small*
 create_test_zip.py
+.pytest_cache
+.vscode
