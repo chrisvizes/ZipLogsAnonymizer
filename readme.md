@@ -88,3 +88,11 @@ Unit tests for each individual find and replace could improve our trust in their
    3. **If it fails at any point, deletes the directory it just made that may have incomplete sanitizing**
    4. Updates the user on its progress as it runs and confirms the result at the end.
       1. Reading out what kind of sensitive information was replaced and how many times would be a useful confirmation of parsing
+   5. The unzipped directory of logs in the original structure is left for the user with anonymized logs
+
+## Challenges for the script
+
+1. Volume of files to process
+   1. A typical logs dump can be from 500MB to 2GB as a zip file containing several thousand log files
+   2. To process 5K log files in 10 minutes, you'd need to process 8 per second
+   3. The unzipped logs could be 5-10GB

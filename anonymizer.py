@@ -4,339 +4,294 @@ ZipLogsAnonymizer - Anonymize sensitive data in log archives for safe sharing wi
 
 Usage: python anonymizer.py <path_to_zipfile>
 
-This script extracts a zip file, anonymizes sensitive data in all text-based files,
-and creates a new anonymized zip file ready for sharing.
+Optimized for large zip files (up to 2GB) with:
+- Batch processing to limit memory usage
+- Parallel anonymization within each batch
+- Outputs to an unzipped directory (preserving original structure)
 """
 
 import argparse
-import json
 import os
 import re
-import shutil
 import sys
 import zipfile
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Optional
+import multiprocessing
 
 
-class ReplacementMapper:
-    """Maintains consistent mappings from original values to anonymized replacements."""
+# File extensions to process as text
+TEXT_EXTENSIONS = {
+    ".log", ".txt", ".json", ".xml", ".yml", ".yaml",
+    ".properties", ".conf", ".config", ".csv", ".html", ".htm",
+}
 
-    def __init__(self):
-        self.mappings: dict[str, dict[str, str]] = defaultdict(dict)
-        self.counters: dict[str, int] = defaultdict(int)
-        self.stats: dict[str, int] = defaultdict(int)
-
-    def get_replacement(self, category: str, original: str, prefix: str) -> str:
-        """Get or create a consistent replacement for an original value."""
-        if original not in self.mappings[category]:
-            self.counters[category] += 1
-            self.mappings[category][original] = f"{prefix}_{self.counters[category]:03d}"
-        self.stats[category] += 1
-        return self.mappings[category][original]
-
-    def get_stats(self) -> dict[str, int]:
-        """Return replacement statistics."""
-        return dict(self.stats)
-
-    def get_unique_counts(self) -> dict[str, int]:
-        """Return count of unique values replaced per category."""
-        return {cat: len(vals) for cat, vals in self.mappings.items()}
+# Batch size for processing (limit memory usage)
+BATCH_SIZE = 100  # Process 100 files at a time
+MAX_FILE_SIZE_FOR_PARALLEL = 10 * 1024 * 1024  # 10MB - larger files processed serially
 
 
-class LogAnonymizer:
-    """Handles anonymization of log file contents."""
+@dataclass
+class AnonymizationResult:
+    """Result from anonymizing a single file."""
+    filename: str
+    content: bytes
+    replacements: dict[str, int]  # category -> count (not full list, to save memory)
+    error: Optional[str] = None
 
-    # File extensions to process
-    TEXT_EXTENSIONS = {'.log', '.txt', '.json', '.xml', '.yml', '.yaml', '.properties', '.conf', '.config', '.csv'}
+
+class PatternMatcher:
+    """Compiled regex patterns for sensitive data detection."""
 
     def __init__(self):
-        self.mapper = ReplacementMapper()
-        self._compile_patterns()
+        self.patterns = self._compile_patterns()
 
-    def _compile_patterns(self):
-        """Compile all regex patterns for sensitive data detection."""
+    def _compile_patterns(self) -> list[tuple[str, re.Pattern, str, bool]]:
+        """Returns list of (category, pattern, replacement_template, uses_groups)."""
+        patterns = []
 
         # Email addresses
-        self.email_pattern = re.compile(
-            r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',
-            re.IGNORECASE
-        )
+        patterns.append((
+            "email",
+            re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", re.IGNORECASE),
+            "{UNIQUE}@redacted.com",
+            False,
+        ))
 
         # Internal IP addresses (private ranges)
-        self.internal_ip_pattern = re.compile(
-            r'\b(?:'
-            r'10\.\d{1,3}\.\d{1,3}\.\d{1,3}|'  # 10.x.x.x
-            r'192\.168\.\d{1,3}\.\d{1,3}|'      # 192.168.x.x
-            r'172\.(?:1[6-9]|2[0-9]|3[01])\.\d{1,3}\.\d{1,3}'  # 172.16-31.x.x
-            r')\b'
-        )
+        patterns.append((
+            "internal_ip",
+            re.compile(
+                r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+                r"192\.168\.\d{1,3}\.\d{1,3}|"
+                r"172\.(?:1[6-9]|2[0-9]|3[01])\.\d{1,3}\.\d{1,3})\b"
+            ),
+            "{UNIQUE}",
+            False,
+        ))
 
-        # External/general IP addresses (excluding localhost and private)
-        self.external_ip_pattern = re.compile(
-            r'\b(?!127\.0\.0\.1\b)(?!10\.\d)(?!192\.168\.)(?!172\.(?:1[6-9]|2\d|3[01])\.)'
-            r'(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}'
-            r'(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b'
-        )
-
-        # Hostnames (common internal patterns)
-        self.hostname_pattern = re.compile(
-            r'\b(?:[a-zA-Z][a-zA-Z0-9-]*\.)+(?:local|internal|corp|lan|intranet|private)\b',
-            re.IGNORECASE
-        )
-
-        # UNC paths
-        self.unc_path_pattern = re.compile(
-            r'\\\\[a-zA-Z0-9_.-]+\\[a-zA-Z0-9_.$-]+(?:\\[a-zA-Z0-9_.$-]+)*'
-        )
-
-        # Passwords in various formats
-        self.password_patterns = [
-            re.compile(r'(password\s*[=:]\s*)([^\s,;\'"}\]]+)', re.IGNORECASE),
-            re.compile(r'(pwd\s*[=:]\s*)([^\s,;\'"}\]]+)', re.IGNORECASE),
-            re.compile(r'(passwd\s*[=:]\s*)([^\s,;\'"}\]]+)', re.IGNORECASE),
-            re.compile(r'(secret\s*[=:]\s*)([^\s,;\'"}\]]+)', re.IGNORECASE),
-            re.compile(r'("password"\s*:\s*")([^"]+)', re.IGNORECASE),
-            re.compile(r'("pwd"\s*:\s*")([^"]+)', re.IGNORECASE),
-        ]
-
-        # API keys and tokens (common patterns)
-        self.api_key_patterns = [
-            re.compile(r'(api[_-]?key\s*[=:]\s*)([a-zA-Z0-9_-]{20,})', re.IGNORECASE),
-            re.compile(r'(token\s*[=:]\s*)([a-zA-Z0-9_-]{20,})', re.IGNORECASE),
-            re.compile(r'(bearer\s+)([a-zA-Z0-9_.-]{20,})', re.IGNORECASE),
-            re.compile(r'("api[_-]?key"\s*:\s*")([^"]{20,})', re.IGNORECASE),
-            re.compile(r'("token"\s*:\s*")([^"]{20,})', re.IGNORECASE),
-            re.compile(r'\b(sk-[a-zA-Z0-9]{20,})\b'),  # OpenAI-style keys
-            re.compile(r'\b(pk_[a-zA-Z0-9]{20,})\b'),  # Stripe-style keys
-        ]
-
-        # Authorization headers
-        self.auth_header_pattern = re.compile(
-            r'(Authorization\s*:\s*)(Basic|Bearer|Digest)\s+([^\s\r\n]+)',
-            re.IGNORECASE
-        )
-
-        # Database connection strings
-        self.db_connection_patterns = [
-            re.compile(r'(jdbc:[a-zA-Z0-9]+://[^;\s]+)', re.IGNORECASE),
-            re.compile(r'((?:Server|Data Source)\s*=\s*)([^;\s]+)', re.IGNORECASE),
-            re.compile(r'((?:User ID|uid)\s*=\s*)([^;\s]+)', re.IGNORECASE),
-        ]
-
-        # Private keys and certificates
-        self.private_key_pattern = re.compile(
-            r'-----BEGIN (?:RSA |DSA |EC )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |DSA |EC )?PRIVATE KEY-----'
-        )
-        self.certificate_pattern = re.compile(
-            r'-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----'
-        )
-
-        # MAC addresses
-        self.mac_address_pattern = re.compile(
-            r'\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b'
-        )
-
-        # Credit card numbers (basic pattern with Luhn validation done separately)
-        self.credit_card_pattern = re.compile(
-            r'\b(?:\d{4}[- ]?){3}\d{4}\b'
-        )
-
-        # SSN pattern (US format)
-        self.ssn_pattern = re.compile(
-            r'\b\d{3}-\d{2}-\d{4}\b'
-        )
-
-        # Usernames in context
-        self.username_patterns = [
-            re.compile(r'(user(?:name)?\s*[=:]\s*)([a-zA-Z0-9_@.-]+)', re.IGNORECASE),
-            re.compile(r'("user(?:name)?"\s*:\s*")([^"]+)', re.IGNORECASE),
-            re.compile(r'(login\s*[=:]\s*)([a-zA-Z0-9_@.-]+)', re.IGNORECASE),
-        ]
-
-        # Tableau-specific patterns
-        self.site_pattern = re.compile(r'(site\s*[=:]\s*)([a-zA-Z0-9_-]+)', re.IGNORECASE)
-        self.workbook_pattern = re.compile(r'(workbook\s*[=:]\s*)([^\s,;\'"}\]]+)', re.IGNORECASE)
-        self.datasource_pattern = re.compile(r'(datasource\s*[=:]\s*)([^\s,;\'"}\]]+)', re.IGNORECASE)
-        self.project_pattern = re.compile(r'(project\s*[=:]\s*)([^\s,;\'"}\]]+)', re.IGNORECASE)
-
-    def _luhn_check(self, card_number: str) -> bool:
-        """Validate credit card number using Luhn algorithm."""
-        digits = [int(d) for d in card_number if d.isdigit()]
-        if len(digits) < 13 or len(digits) > 19:
-            return False
-
-        checksum = 0
-        for i, digit in enumerate(reversed(digits)):
-            if i % 2 == 1:
-                digit *= 2
-                if digit > 9:
-                    digit -= 9
-            checksum += digit
-        return checksum % 10 == 0
-
-    def anonymize_content(self, content: str) -> str:
-        """Anonymize all sensitive data in the given content."""
-
-        # Email addresses
-        content = self.email_pattern.sub(
-            lambda m: self.mapper.get_replacement('email', m.group(0), 'USER_EMAIL') + '@redacted.com',
-            content
-        )
-
-        # Internal IP addresses
-        content = self.internal_ip_pattern.sub(
-            lambda m: self.mapper.get_replacement('internal_ip', m.group(0), 'INTERNAL_IP'),
-            content
-        )
-
-        # External IP addresses
-        content = self.external_ip_pattern.sub(
-            lambda m: self.mapper.get_replacement('external_ip', m.group(0), 'EXTERNAL_IP'),
-            content
-        )
-
-        # Hostnames
-        content = self.hostname_pattern.sub(
-            lambda m: self.mapper.get_replacement('hostname', m.group(0), 'HOST') + '.redacted',
-            content
-        )
-
-        # UNC paths
-        content = self.unc_path_pattern.sub(
-            lambda m: '\\\\REDACTED_SERVER\\REDACTED_SHARE',
-            content
-        )
-
-        # Passwords
-        for pattern in self.password_patterns:
-            content = pattern.sub(
-                lambda m: m.group(1) + 'PASSWORD_REDACTED',
-                content
-            )
+        # Passwords (combined pattern)
+        patterns.append((
+            "password",
+            re.compile(
+                r'((?:password|passwd|pwd|secret)\s*[=:]\s*)[^\s,;\'"}\]]+|'
+                r'("(?:password|passwd|pwd|secret)"\s*:\s*")[^"]+',
+                re.IGNORECASE,
+            ),
+            r"\1PASSWORD_REDACTED",
+            True,
+        ))
 
         # API keys and tokens
-        for pattern in self.api_key_patterns:
-            if pattern.groups == 2:
-                content = pattern.sub(
-                    lambda m: m.group(1) + 'API_KEY_REDACTED',
-                    content
-                )
-            else:
-                content = pattern.sub('API_KEY_REDACTED', content)
+        patterns.append((
+            "api_key",
+            re.compile(
+                r"((?:api[_-]?key|token|bearer)\s*[=:]\s*)[a-zA-Z0-9_-]{20,}|"
+                r'("(?:api[_-]?key|token)"\s*:\s*")[^"]{20,}|'
+                r"\b(sk-[a-zA-Z0-9]{20,})\b|"
+                r"\b(pk_[a-zA-Z0-9]{20,})\b",
+                re.IGNORECASE,
+            ),
+            "API_KEY_REDACTED",
+            True,
+        ))
 
         # Authorization headers
-        content = self.auth_header_pattern.sub(
-            lambda m: m.group(1) + m.group(2) + ' AUTH_TOKEN_REDACTED',
-            content
-        )
+        patterns.append((
+            "auth_header",
+            re.compile(
+                r"(Authorization\s*:\s*(?:Basic|Bearer|Digest)\s+)[^\s\r\n]+",
+                re.IGNORECASE,
+            ),
+            r"\1AUTH_TOKEN_REDACTED",
+            True,
+        ))
 
         # Database connection strings
-        for pattern in self.db_connection_patterns:
-            content = pattern.sub(
-                lambda m: m.group(1) + 'DB_CONNECTION_REDACTED' if pattern.groups == 2 else 'DB_CONNECTION_REDACTED',
-                content
-            )
+        patterns.append((
+            "db_connection",
+            re.compile(
+                r"jdbc:[a-zA-Z0-9]+://[^;\s]+|"
+                r"(?:Server|Data Source|User ID|uid)\s*=\s*[^;\s]+",
+                re.IGNORECASE,
+            ),
+            "DB_REDACTED",
+            False,
+        ))
 
-        # Private keys
-        content = self.private_key_pattern.sub('PRIVATE_KEY_REDACTED', content)
-        self.mapper.stats['private_key'] += len(self.private_key_pattern.findall(content))
+        # UNC paths
+        patterns.append((
+            "unc_path",
+            re.compile(r"\\\\[a-zA-Z0-9_.-]+\\[a-zA-Z0-9_.$-]+(?:\\[a-zA-Z0-9_.$-]+)*"),
+            r"\\\\REDACTED_SERVER\\REDACTED_SHARE",
+            False,
+        ))
 
-        # Certificates
-        content = self.certificate_pattern.sub('CERTIFICATE_REDACTED', content)
-        self.mapper.stats['certificate'] += len(self.certificate_pattern.findall(content))
+        # Hostnames with internal TLDs
+        patterns.append((
+            "hostname",
+            re.compile(
+                r"\b(?:[a-zA-Z][a-zA-Z0-9-]*\.)+(?:local|internal|corp|lan|intranet|private)\b",
+                re.IGNORECASE,
+            ),
+            "{UNIQUE}.redacted",
+            False,
+        ))
 
         # MAC addresses
-        content = self.mac_address_pattern.sub(
-            lambda m: self.mapper.get_replacement('mac_address', m.group(0), 'MAC'),
-            content
-        )
+        patterns.append((
+            "mac_address",
+            re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b"),
+            "MAC_REDACTED",
+            False,
+        ))
 
-        # Credit card numbers (with Luhn validation)
-        def replace_cc(match):
-            cc = match.group(0)
-            cc_digits = ''.join(c for c in cc if c.isdigit())
-            if self._luhn_check(cc_digits):
-                self.mapper.stats['credit_card'] += 1
-                return 'CREDIT_CARD_REDACTED'
-            return cc
-        content = self.credit_card_pattern.sub(replace_cc, content)
+        # Usernames in context
+        patterns.append((
+            "username",
+            re.compile(
+                r"((?:user(?:name)?|login)\s*[=:]\s*)([a-zA-Z0-9_@.-]+)|"
+                r'("(?:user(?:name)?|login)"\s*:\s*")([^"]+)',
+                re.IGNORECASE,
+            ),
+            r"\1{UNIQUE}",
+            True,
+        ))
 
-        # SSN
-        content = self.ssn_pattern.sub(
-            lambda m: 'SSN_REDACTED',
-            content
-        )
+        # Private keys and certificates
+        patterns.append((
+            "private_key",
+            re.compile(r"-----BEGIN (?:RSA |DSA |EC )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |DSA |EC )?PRIVATE KEY-----"),
+            "PRIVATE_KEY_REDACTED",
+            False,
+        ))
+        patterns.append((
+            "certificate",
+            re.compile(r"-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----"),
+            "CERTIFICATE_REDACTED",
+            False,
+        ))
 
-        # Usernames
-        for pattern in self.username_patterns:
-            content = pattern.sub(
-                lambda m: m.group(1) + self.mapper.get_replacement('username', m.group(2), 'USER'),
-                content
-            )
+        # SSN (US format)
+        patterns.append((
+            "ssn",
+            re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
+            "SSN_REDACTED",
+            False,
+        ))
 
         # Tableau-specific
-        content = self.site_pattern.sub(
-            lambda m: m.group(1) + self.mapper.get_replacement('site', m.group(2), 'SITE'),
-            content
-        )
-        content = self.workbook_pattern.sub(
-            lambda m: m.group(1) + self.mapper.get_replacement('workbook', m.group(2), 'WORKBOOK'),
-            content
-        )
-        content = self.datasource_pattern.sub(
-            lambda m: m.group(1) + self.mapper.get_replacement('datasource', m.group(2), 'DATASOURCE'),
-            content
-        )
-        content = self.project_pattern.sub(
-            lambda m: m.group(1) + self.mapper.get_replacement('project', m.group(2), 'PROJECT'),
-            content
-        )
+        patterns.append((
+            "tableau_entity",
+            re.compile(
+                r'((?:site|workbook|datasource|project)\s*[=:]\s*)([^\s,;\'"}\]]+)',
+                re.IGNORECASE,
+            ),
+            r"\1{UNIQUE}",
+            True,
+        ))
 
-        return content
+        return patterns
 
-    def should_process_file(self, filepath: Path) -> bool:
-        """Check if a file should be processed based on its extension."""
-        return filepath.suffix.lower() in self.TEXT_EXTENSIONS
 
-    def process_file(self, filepath: Path) -> bool:
-        """Process a single file, anonymizing its contents. Returns True if successful."""
+# Global pattern matcher (compiled once per process)
+_matcher: Optional[PatternMatcher] = None
+
+
+def get_matcher() -> PatternMatcher:
+    global _matcher
+    if _matcher is None:
+        _matcher = PatternMatcher()
+    return _matcher
+
+
+def is_likely_binary(data: bytes, sample_size: int = 8192) -> bool:
+    """Quick check if data is likely binary."""
+    sample = data[:sample_size]
+    if b"\x00" in sample:
+        return True
+    non_text = sum(1 for b in sample if b < 32 and b not in (9, 10, 13))
+    return non_text / len(sample) > 0.1 if sample else False
+
+
+def anonymize_content(content: str, matcher: PatternMatcher) -> tuple[str, dict[str, int]]:
+    """Anonymize content. Returns (anonymized_content, category -> count)."""
+    counts: dict[str, int] = defaultdict(int)
+    unique_counters: dict[str, dict[str, int]] = defaultdict(dict)
+
+    def get_unique_replacement(category: str, original: str, template: str) -> str:
+        if original not in unique_counters[category]:
+            unique_counters[category][original] = len(unique_counters[category]) + 1
+        idx = unique_counters[category][original]
+        return template.replace("{UNIQUE}", f"{category.upper()}_{idx:03d}")
+
+    for category, pattern, replacement_template, uses_groups in matcher.patterns:
+        if "{UNIQUE}" in replacement_template:
+            def make_replacer(cat, templ):
+                def replacer(m):
+                    original = m.group(0)
+                    counts[cat] += 1
+                    if uses_groups and m.lastindex:
+                        prefix = m.group(1) or ""
+                        return prefix + get_unique_replacement(cat, original, templ.replace(r"\1", ""))
+                    return get_unique_replacement(cat, original, templ)
+                return replacer
+            content = pattern.sub(make_replacer(category, replacement_template), content)
+        elif uses_groups:
+            def make_simple_replacer(cat, templ):
+                def replacer(m):
+                    counts[cat] += 1
+                    result = templ
+                    for i in range(1, (m.lastindex or 0) + 1):
+                        grp = m.group(i)
+                        if grp:
+                            result = result.replace(f"\\{i}", grp)
+                            break
+                    return result
+                return replacer
+            content = pattern.sub(make_simple_replacer(category, replacement_template), content)
+        else:
+            match_count = len(pattern.findall(content))
+            if match_count:
+                counts[category] += match_count
+                content = pattern.sub(replacement_template, content)
+
+    return content, dict(counts)
+
+
+def process_single_file(args: tuple[str, bytes]) -> AnonymizationResult:
+    """Process a single file's content."""
+    filename, data = args
+
+    if is_likely_binary(data):
+        return AnonymizationResult(filename, data, {})
+
+    content = None
+    for encoding in ["utf-8", "utf-16", "latin-1", "cp1252"]:
         try:
-            # Try to read as text with various encodings
-            content = None
-            for encoding in ['utf-8', 'utf-16', 'latin-1', 'cp1252']:
-                try:
-                    with open(filepath, 'r', encoding=encoding) as f:
-                        content = f.read()
-                    break
-                except UnicodeDecodeError:
-                    continue
+            content = data.decode(encoding)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
 
-            if content is None:
-                print(f"  Warning: Could not decode {filepath.name}, skipping")
-                return True  # Not a failure, just can't process
+    if content is None:
+        return AnonymizationResult(filename, data, {})
 
-            # Anonymize content
-            anonymized = self.anonymize_content(content)
-
-            # Write back
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.write(anonymized)
-
-            return True
-
-        except Exception as e:
-            print(f"  Error processing {filepath}: {e}")
-            return False
+    try:
+        matcher = get_matcher()
+        anonymized, counts = anonymize_content(content, matcher)
+        return AnonymizationResult(filename, anonymized.encode("utf-8"), counts)
+    except Exception as e:
+        return AnonymizationResult(filename, data, {}, error=str(e))
 
 
-def process_zip(zip_path: str) -> bool:
-    """
-    Main processing function.
-    Extracts zip, anonymizes all files, creates anonymized zip.
-    Returns True on success, False on failure.
-    """
+def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
+    """Main processing function with batched processing for memory efficiency."""
+    import shutil
+
     zip_path = Path(zip_path)
 
     if not zip_path.exists():
@@ -347,112 +302,148 @@ def process_zip(zip_path: str) -> bool:
         print(f"Error: Not a valid zip file: {zip_path}")
         return False
 
-    # Create output directory name
+    # Output is a directory, not a zip
     output_dir = zip_path.parent / (zip_path.stem + "_anonymized")
-    output_zip = zip_path.parent / (zip_path.stem + "_anonymized.zip")
 
     # Clean up any existing output
     if output_dir.exists():
         shutil.rmtree(output_dir)
-    if output_zip.exists():
-        output_zip.unlink()
 
-    anonymizer = LogAnonymizer()
+    if max_workers is None:
+        max_workers = min(multiprocessing.cpu_count(), 8)
+
+    print(f"Processing {zip_path.name} with {max_workers} workers...")
+    sys.stdout.flush()
+
+    total_stats: dict[str, int] = defaultdict(int)
+    errors = []
 
     try:
-        # Extract zip
-        print(f"Extracting {zip_path.name}...")
-        with zipfile.ZipFile(zip_path, 'r') as zf:
-            zf.extractall(output_dir)
+        with zipfile.ZipFile(zip_path, "r") as src_zip:
+            entries = [e for e in src_zip.infolist() if not e.is_dir()]
+            total_files = len(entries)
 
-        # Get all files to process
-        all_files = list(output_dir.rglob('*'))
-        text_files = [f for f in all_files if f.is_file() and anonymizer.should_process_file(f)]
+            # Categorize files
+            text_entries = []
+            binary_entries = []
+            for entry in entries:
+                ext = Path(entry.filename).suffix.lower()
+                if ext in TEXT_EXTENSIONS:
+                    text_entries.append(entry)
+                else:
+                    binary_entries.append(entry)
 
-        print(f"Found {len(text_files)} text files to anonymize...")
+            print(f"Found {total_files} files: {len(text_entries)} text, {len(binary_entries)} binary/other")
+            sys.stdout.flush()
 
-        # Process each file
-        processed = 0
-        failed = 0
-        for filepath in text_files:
-            relative = filepath.relative_to(output_dir)
-            if anonymizer.process_file(filepath):
-                processed += 1
-            else:
-                failed += 1
+            # Create output directory structure
+            output_dir.mkdir(parents=True, exist_ok=True)
 
-            # Progress update every 50 files
-            if processed % 50 == 0:
-                print(f"  Processed {processed}/{len(text_files)} files...")
+            # Create all subdirectories first
+            for entry in src_zip.infolist():
+                if entry.is_dir():
+                    (output_dir / entry.filename).mkdir(parents=True, exist_ok=True)
 
-        if failed > 0:
-            raise Exception(f"{failed} files failed to process")
+            # Copy binary files directly (no processing needed)
+            print("Copying binary files...")
+            sys.stdout.flush()
+            for entry in binary_entries:
+                data = src_zip.read(entry.filename)
+                out_path = output_dir / entry.filename
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_bytes(data)
 
-        print(f"Processed {processed} files successfully")
+            # Process text files in batches
+            print("Anonymizing text files...")
+            sys.stdout.flush()
+            processed = 0
 
-        # Create anonymized zip
-        print(f"Creating anonymized zip: {output_zip.name}...")
-        with zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for filepath in output_dir.rglob('*'):
-                if filepath.is_file():
-                    arcname = filepath.relative_to(output_dir)
-                    zf.write(filepath, arcname)
+            for batch_start in range(0, len(text_entries), BATCH_SIZE):
+                batch_entries = text_entries[batch_start:batch_start + BATCH_SIZE]
 
-        # Clean up extracted directory
-        shutil.rmtree(output_dir)
+                # Read batch data
+                batch_data = []
+                for entry in batch_entries:
+                    data = src_zip.read(entry.filename)
+                    batch_data.append((entry.filename, data))
 
-        # Print statistics
-        print("\n" + "="*60)
+                # Process batch in parallel
+                results = {}
+                with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {executor.submit(process_single_file, f): f[0] for f in batch_data}
+                    for future in as_completed(futures):
+                        result = future.result()
+                        results[result.filename] = result
+                        for cat, count in result.replacements.items():
+                            total_stats[cat] += count
+                        if result.error:
+                            errors.append(f"{result.filename}: {result.error}")
+
+                # Write batch results to output directory
+                for entry in batch_entries:
+                    result = results[entry.filename]
+                    out_path = output_dir / entry.filename
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    out_path.write_bytes(result.content)
+
+                processed += len(batch_entries)
+                print(f"  Processed {processed}/{len(text_entries)} text files...")
+                sys.stdout.flush()
+
+        # Print results
+        print("\n" + "=" * 60)
         print("ANONYMIZATION COMPLETE")
-        print("="*60)
-        print(f"\nOutput file: {output_zip}")
-        print(f"\nReplacement Statistics (total occurrences):")
+        print("=" * 60)
+        print(f"\nOutput directory: {output_dir}")
+        print(f"Original zip size: {zip_path.stat().st_size / 1024 / 1024:.1f} MB")
 
-        stats = anonymizer.mapper.get_stats()
-        unique = anonymizer.mapper.get_unique_counts()
+        if total_stats:
+            print(f"\nReplacements made:")
+            for cat in sorted(total_stats.keys()):
+                print(f"  {cat}: {total_stats[cat]}")
+        else:
+            print("\nNo sensitive data patterns found.")
 
-        for category in sorted(stats.keys()):
-            total = stats[category]
-            uniq = unique.get(category, 0)
-            print(f"  {category}: {total} replacements ({uniq} unique values)")
+        if errors:
+            print(f"\nWarnings ({len(errors)}):")
+            for err in errors[:5]:
+                print(f"  {err}")
+            if len(errors) > 5:
+                print(f"  ... and {len(errors) - 5} more")
 
-        if not stats:
-            print("  No sensitive data patterns were found.")
-
-        print("\n" + "="*60)
-
+        print("=" * 60)
+        sys.stdout.flush()
         return True
 
     except Exception as e:
         print(f"\nError during processing: {e}")
-        print("Cleaning up...")
-
+        import traceback
+        traceback.print_exc()
         # Clean up on failure
         if output_dir.exists():
             shutil.rmtree(output_dir)
-        if output_zip.exists():
-            output_zip.unlink()
-
         return False
 
 
 def main():
+    global BATCH_SIZE
+
     parser = argparse.ArgumentParser(
-        description='Anonymize sensitive data in log archives for safe sharing with LLMs.',
+        description="Anonymize sensitive data in log archives.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''
-Examples:
-  python anonymizer.py ziplogs.zip
-  python anonymizer.py "path/to/logs archive.zip"
-        '''
     )
-    parser.add_argument('zipfile', help='Path to the zip file containing logs')
+    parser.add_argument("zipfile", help="Path to the zip file")
+    parser.add_argument("-w", "--workers", type=int, default=None,
+                       help="Number of parallel workers (default: CPU count, max 8)")
+    parser.add_argument("-b", "--batch-size", type=int, default=BATCH_SIZE,
+                       help=f"Files per batch (default: {BATCH_SIZE})")
 
     args = parser.parse_args()
+    BATCH_SIZE = args.batch_size
 
-    success = process_zip(args.zipfile)
+    success = process_zip(args.zipfile, args.workers)
     sys.exit(0 if success else 1)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
