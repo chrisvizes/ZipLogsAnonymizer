@@ -25,8 +25,18 @@ import multiprocessing
 
 # File extensions to process as text
 TEXT_EXTENSIONS = {
-    ".log", ".txt", ".json", ".xml", ".yml", ".yaml",
-    ".properties", ".conf", ".config", ".csv", ".html", ".htm",
+    ".log",
+    ".txt",
+    ".json",
+    ".xml",
+    ".yml",
+    ".yaml",
+    ".properties",
+    ".conf",
+    ".config",
+    ".csv",
+    ".html",
+    ".htm",
 }
 
 # Batch size for processing (limit memory usage)
@@ -37,6 +47,7 @@ MAX_FILE_SIZE_FOR_PARALLEL = 10 * 1024 * 1024  # 10MB - larger files processed s
 @dataclass
 class AnonymizationResult:
     """Result from anonymizing a single file."""
+
     filename: str
     content: bytes
     replacements: dict[str, int]  # category -> count (not full list, to save memory)
@@ -54,145 +65,181 @@ class PatternMatcher:
         patterns = []
 
         # Email addresses
-        patterns.append((
-            "email",
-            re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", re.IGNORECASE),
-            "{UNIQUE}@redacted.com",
-            False,
-        ))
+        patterns.append(
+            (
+                "email",
+                re.compile(
+                    r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", re.IGNORECASE
+                ),
+                "{UNIQUE}@redacted.com",
+                False,
+            )
+        )
 
         # Internal IP addresses (private ranges)
-        patterns.append((
-            "internal_ip",
-            re.compile(
-                r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
-                r"192\.168\.\d{1,3}\.\d{1,3}|"
-                r"172\.(?:1[6-9]|2[0-9]|3[01])\.\d{1,3}\.\d{1,3})\b"
-            ),
-            "{UNIQUE}",
-            False,
-        ))
+        patterns.append(
+            (
+                "internal_ip",
+                re.compile(
+                    r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+                    r"192\.168\.\d{1,3}\.\d{1,3}|"
+                    r"172\.(?:1[6-9]|2[0-9]|3[01])\.\d{1,3}\.\d{1,3})\b"
+                ),
+                "{UNIQUE}",
+                False,
+            )
+        )
 
         # Passwords (combined pattern)
-        patterns.append((
-            "password",
-            re.compile(
-                r'((?:password|passwd|pwd|secret)\s*[=:]\s*)[^\s,;\'"}\]]+|'
-                r'("(?:password|passwd|pwd|secret)"\s*:\s*")[^"]+',
-                re.IGNORECASE,
-            ),
-            r"\1PASSWORD_REDACTED",
-            True,
-        ))
+        patterns.append(
+            (
+                "password",
+                re.compile(
+                    r'((?:password|passwd|pwd|secret)\s*[=:]\s*)[^\s,;\'"}\]]+|'
+                    r'("(?:password|passwd|pwd|secret)"\s*:\s*")[^"]+',
+                    re.IGNORECASE,
+                ),
+                r"\1PASSWORD_REDACTED",
+                True,
+            )
+        )
 
         # API keys and tokens
-        patterns.append((
-            "api_key",
-            re.compile(
-                r"((?:api[_-]?key|token|bearer)\s*[=:]\s*)[a-zA-Z0-9_-]{20,}|"
-                r'("(?:api[_-]?key|token)"\s*:\s*")[^"]{20,}|'
-                r"\b(sk-[a-zA-Z0-9]{20,})\b|"
-                r"\b(pk_[a-zA-Z0-9]{20,})\b",
-                re.IGNORECASE,
-            ),
-            "API_KEY_REDACTED",
-            True,
-        ))
+        patterns.append(
+            (
+                "api_key",
+                re.compile(
+                    r"((?:api[_-]?key|token|bearer)\s*[=:]\s*)[a-zA-Z0-9_-]{20,}|"
+                    r'("(?:api[_-]?key|token)"\s*:\s*")[^"]{20,}|'
+                    r"\b(sk-[a-zA-Z0-9]{20,})\b|"
+                    r"\b(pk_[a-zA-Z0-9]{20,})\b",
+                    re.IGNORECASE,
+                ),
+                "API_KEY_REDACTED",
+                True,
+            )
+        )
 
         # Authorization headers
-        patterns.append((
-            "auth_header",
-            re.compile(
-                r"(Authorization\s*:\s*(?:Basic|Bearer|Digest)\s+)[^\s\r\n]+",
-                re.IGNORECASE,
-            ),
-            r"\1AUTH_TOKEN_REDACTED",
-            True,
-        ))
+        patterns.append(
+            (
+                "auth_header",
+                re.compile(
+                    r"(Authorization\s*:\s*(?:Basic|Bearer|Digest)\s+)[^\s\r\n]+",
+                    re.IGNORECASE,
+                ),
+                r"\1AUTH_TOKEN_REDACTED",
+                True,
+            )
+        )
 
         # Database connection strings
-        patterns.append((
-            "db_connection",
-            re.compile(
-                r"jdbc:[a-zA-Z0-9]+://[^;\s]+|"
-                r"(?:Server|Data Source|User ID|uid)\s*=\s*[^;\s]+",
-                re.IGNORECASE,
-            ),
-            "DB_REDACTED",
-            False,
-        ))
+        patterns.append(
+            (
+                "db_connection",
+                re.compile(
+                    r"jdbc:[a-zA-Z0-9]+://[^;\s]+|"
+                    r"(?:Server|Data Source|User ID|uid)\s*=\s*[^;\s]+",
+                    re.IGNORECASE,
+                ),
+                "DB_REDACTED",
+                False,
+            )
+        )
 
         # UNC paths
-        patterns.append((
-            "unc_path",
-            re.compile(r"\\\\[a-zA-Z0-9_.-]+\\[a-zA-Z0-9_.$-]+(?:\\[a-zA-Z0-9_.$-]+)*"),
-            r"\\\\REDACTED_SERVER\\REDACTED_SHARE",
-            False,
-        ))
+        patterns.append(
+            (
+                "unc_path",
+                re.compile(
+                    r"\\\\[a-zA-Z0-9_.-]+\\[a-zA-Z0-9_.$-]+(?:\\[a-zA-Z0-9_.$-]+)*"
+                ),
+                r"\\\\REDACTED_SERVER\\REDACTED_SHARE",
+                False,
+            )
+        )
 
         # Hostnames with internal TLDs
-        patterns.append((
-            "hostname",
-            re.compile(
-                r"\b(?:[a-zA-Z][a-zA-Z0-9-]*\.)+(?:local|internal|corp|lan|intranet|private)\b",
-                re.IGNORECASE,
-            ),
-            "{UNIQUE}.redacted",
-            False,
-        ))
+        patterns.append(
+            (
+                "hostname",
+                re.compile(
+                    r"\b(?:[a-zA-Z][a-zA-Z0-9-]*\.)+(?:local|internal|corp|lan|intranet|private)\b",
+                    re.IGNORECASE,
+                ),
+                "{UNIQUE}.redacted",
+                False,
+            )
+        )
 
         # MAC addresses
-        patterns.append((
-            "mac_address",
-            re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b"),
-            "MAC_REDACTED",
-            False,
-        ))
+        patterns.append(
+            (
+                "mac_address",
+                re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b"),
+                "MAC_REDACTED",
+                False,
+            )
+        )
 
         # Usernames in context
-        patterns.append((
-            "username",
-            re.compile(
-                r"((?:user(?:name)?|login)\s*[=:]\s*)([a-zA-Z0-9_@.-]+)|"
-                r'("(?:user(?:name)?|login)"\s*:\s*")([^"]+)',
-                re.IGNORECASE,
-            ),
-            r"\1{UNIQUE}",
-            True,
-        ))
+        patterns.append(
+            (
+                "username",
+                re.compile(
+                    r"((?:user(?:name)?|login)\s*[=:]\s*)([a-zA-Z0-9_@.-]+)|"
+                    r'("(?:user(?:name)?|login)"\s*:\s*")([^"]+)',
+                    re.IGNORECASE,
+                ),
+                r"\1{UNIQUE}",
+                True,
+            )
+        )
 
         # Private keys and certificates
-        patterns.append((
-            "private_key",
-            re.compile(r"-----BEGIN (?:RSA |DSA |EC )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |DSA |EC )?PRIVATE KEY-----"),
-            "PRIVATE_KEY_REDACTED",
-            False,
-        ))
-        patterns.append((
-            "certificate",
-            re.compile(r"-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----"),
-            "CERTIFICATE_REDACTED",
-            False,
-        ))
+        patterns.append(
+            (
+                "private_key",
+                re.compile(
+                    r"-----BEGIN (?:RSA |DSA |EC )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |DSA |EC )?PRIVATE KEY-----"
+                ),
+                "PRIVATE_KEY_REDACTED",
+                False,
+            )
+        )
+        patterns.append(
+            (
+                "certificate",
+                re.compile(
+                    r"-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----"
+                ),
+                "CERTIFICATE_REDACTED",
+                False,
+            )
+        )
 
         # SSN (US format)
-        patterns.append((
-            "ssn",
-            re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
-            "SSN_REDACTED",
-            False,
-        ))
+        patterns.append(
+            (
+                "ssn",
+                re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
+                "SSN_REDACTED",
+                False,
+            )
+        )
 
         # Tableau-specific
-        patterns.append((
-            "tableau_entity",
-            re.compile(
-                r'((?:site|workbook|datasource|project)\s*[=:]\s*)([^\s,;\'"}\]]+)',
-                re.IGNORECASE,
-            ),
-            r"\1{UNIQUE}",
-            True,
-        ))
+        patterns.append(
+            (
+                "tableau_entity",
+                re.compile(
+                    r'((?:site|workbook|datasource|project)\s*[=:]\s*)([^\s,;\'"}\]]+)',
+                    re.IGNORECASE,
+                ),
+                r"\1{UNIQUE}",
+                True,
+            )
+        )
 
         return patterns
 
@@ -217,7 +264,9 @@ def is_likely_binary(data: bytes, sample_size: int = 8192) -> bool:
     return non_text / len(sample) > 0.1 if sample else False
 
 
-def anonymize_content(content: str, matcher: PatternMatcher) -> tuple[str, dict[str, int]]:
+def anonymize_content(
+    content: str, matcher: PatternMatcher
+) -> tuple[str, dict[str, int]]:
     """Anonymize content. Returns (anonymized_content, category -> count)."""
     counts: dict[str, int] = defaultdict(int)
     unique_counters: dict[str, dict[str, int]] = defaultdict(dict)
@@ -230,17 +279,25 @@ def anonymize_content(content: str, matcher: PatternMatcher) -> tuple[str, dict[
 
     for category, pattern, replacement_template, uses_groups in matcher.patterns:
         if "{UNIQUE}" in replacement_template:
+
             def make_replacer(cat, templ):
                 def replacer(m):
                     original = m.group(0)
                     counts[cat] += 1
                     if uses_groups and m.lastindex:
                         prefix = m.group(1) or ""
-                        return prefix + get_unique_replacement(cat, original, templ.replace(r"\1", ""))
+                        return prefix + get_unique_replacement(
+                            cat, original, templ.replace(r"\1", "")
+                        )
                     return get_unique_replacement(cat, original, templ)
+
                 return replacer
-            content = pattern.sub(make_replacer(category, replacement_template), content)
+
+            content = pattern.sub(
+                make_replacer(category, replacement_template), content
+            )
         elif uses_groups:
+
             def make_simple_replacer(cat, templ):
                 def replacer(m):
                     counts[cat] += 1
@@ -251,8 +308,12 @@ def anonymize_content(content: str, matcher: PatternMatcher) -> tuple[str, dict[
                             result = result.replace(f"\\{i}", grp)
                             break
                     return result
+
                 return replacer
-            content = pattern.sub(make_simple_replacer(category, replacement_template), content)
+
+            content = pattern.sub(
+                make_simple_replacer(category, replacement_template), content
+            )
         else:
             match_count = len(pattern.findall(content))
             if match_count:
@@ -333,7 +394,9 @@ def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
                 else:
                     binary_entries.append(entry)
 
-            print(f"Found {total_files} files: {len(text_entries)} text, {len(binary_entries)} binary/other")
+            print(
+                f"Found {total_files} files: {len(text_entries)} text, {len(binary_entries)} binary/other"
+            )
             sys.stdout.flush()
 
             # Create output directory structure
@@ -359,7 +422,7 @@ def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
             processed = 0
 
             for batch_start in range(0, len(text_entries), BATCH_SIZE):
-                batch_entries = text_entries[batch_start:batch_start + BATCH_SIZE]
+                batch_entries = text_entries[batch_start : batch_start + BATCH_SIZE]
 
                 # Read batch data
                 batch_data = []
@@ -370,7 +433,10 @@ def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
                 # Process batch in parallel
                 results = {}
                 with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                    futures = {executor.submit(process_single_file, f): f[0] for f in batch_data}
+                    futures = {
+                        executor.submit(process_single_file, f): f[0]
+                        for f in batch_data
+                    }
                     for future in as_completed(futures):
                         result = future.result()
                         results[result.filename] = result
@@ -418,6 +484,7 @@ def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
     except Exception as e:
         print(f"\nError during processing: {e}")
         import traceback
+
         traceback.print_exc()
         # Clean up on failure
         if output_dir.exists():
@@ -433,10 +500,20 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("zipfile", help="Path to the zip file")
-    parser.add_argument("-w", "--workers", type=int, default=None,
-                       help="Number of parallel workers (default: CPU count, max 8)")
-    parser.add_argument("-b", "--batch-size", type=int, default=BATCH_SIZE,
-                       help=f"Files per batch (default: {BATCH_SIZE})")
+    parser.add_argument(
+        "-w",
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of parallel workers (default: CPU count, max 8)",
+    )
+    parser.add_argument(
+        "-b",
+        "--batch-size",
+        type=int,
+        default=BATCH_SIZE,
+        help=f"Files per batch (default: {BATCH_SIZE})",
+    )
 
     args = parser.parse_args()
     BATCH_SIZE = args.batch_size
