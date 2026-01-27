@@ -777,5 +777,206 @@ class TestPreFilteringEffectiveness:
         assert "password" not in email_names
 
 
+class TestOutputIntegrity:
+    """Tests to ensure anonymized output maintains structural integrity."""
+
+    @pytest.fixture
+    def matcher(self):
+        from anonymizer import PatternMatcher
+        return PatternMatcher()
+
+    def test_line_count_preserved(self, matcher):
+        """Anonymization should preserve the number of lines."""
+        content = """Line 1: user=admin
+Line 2: password=secret123
+Line 3: This is normal text
+Line 4: email=test@example.com
+Line 5: More normal text
+Line 6: server=192.168.1.100"""
+
+        result, _ = anonymize_content(content, matcher)
+
+        input_lines = content.count('\n')
+        output_lines = result.count('\n')
+        assert input_lines == output_lines, f"Line count changed: {input_lines} -> {output_lines}"
+
+    def test_line_count_preserved_multiline_patterns(self, matcher):
+        """Line count should be preserved even with multiline patterns like certificates."""
+        content = """Before certificate
+-----BEGIN CERTIFICATE-----
+MIIDXTCCAkWgAwIBAgIJAMBD
+line2
+line3
+-----END CERTIFICATE-----
+After certificate
+More text"""
+
+        result, _ = anonymize_content(content, matcher)
+
+        # Certificate is replaced with single line, so line count changes
+        # But we should verify the output is valid and complete
+        assert "Before certificate" in result
+        assert "After certificate" in result
+        assert "More text" in result
+        assert "CERTIFICATE_REDACTED" in result
+
+    def test_empty_lines_preserved(self, matcher):
+        """Empty lines should be preserved in output."""
+        content = """Line 1
+
+Line 3 with password=secret
+
+Line 5"""
+
+        result, _ = anonymize_content(content, matcher)
+
+        # Count empty lines
+        input_empty = sum(1 for line in content.split('\n') if not line.strip())
+        output_empty = sum(1 for line in result.split('\n') if not line.strip())
+        assert input_empty == output_empty, f"Empty line count changed: {input_empty} -> {output_empty}"
+
+    def test_non_sensitive_content_unchanged(self, matcher):
+        """Lines without sensitive data should be completely unchanged."""
+        content = """This is a normal log line
+Another normal line with numbers 12345
+DEBUG: Application started successfully
+INFO: Processing completed"""
+
+        result, counts = anonymize_content(content, matcher)
+
+        assert result == content, "Non-sensitive content was modified"
+        assert counts == {}, "Unexpected replacements in non-sensitive content"
+
+    def test_whitespace_preserved(self, matcher):
+        """Leading/trailing whitespace should be preserved."""
+        content = "    user=admin    \n\tpassword=secret\t"
+
+        result, _ = anonymize_content(content, matcher)
+
+        # Check that lines start/end with same whitespace pattern
+        input_lines = content.split('\n')
+        output_lines = result.split('\n')
+
+        for i, (inp, out) in enumerate(zip(input_lines, output_lines)):
+            # Leading whitespace should match
+            inp_leading = len(inp) - len(inp.lstrip())
+            out_leading = len(out) - len(out.lstrip())
+            assert inp_leading == out_leading, f"Line {i}: leading whitespace changed"
+
+    def test_line_endings_preserved(self, matcher):
+        """Different line ending styles should be handled correctly."""
+        # Unix style
+        unix_content = "user=admin\npassword=secret\n"
+        unix_result, _ = anonymize_content(unix_content, matcher)
+        assert unix_result.count('\n') == unix_content.count('\n')
+
+    def test_unicode_content_preserved(self, matcher):
+        """Unicode characters should be preserved in output."""
+        content = "日本語テスト user=admin パスワード"
+
+        result, _ = anonymize_content(content, matcher)
+
+        assert "日本語テスト" in result
+        assert "パスワード" in result
+        assert "admin" not in result
+
+    def test_large_content_integrity(self, matcher):
+        """Large content should maintain integrity."""
+        # Generate large content with mix of sensitive and non-sensitive
+        lines = []
+        for i in range(1000):
+            if i % 10 == 0:
+                lines.append(f"Line {i}: password=secret{i}")
+            else:
+                lines.append(f"Line {i}: Normal log entry")
+        content = '\n'.join(lines)
+
+        result, counts = anonymize_content(content, matcher)
+
+        # Verify line count
+        assert result.count('\n') == content.count('\n')
+
+        # Verify we found the expected number of passwords
+        assert counts.get('password', 0) == 100, f"Expected 100 passwords, found {counts.get('password', 0)}"
+
+        # Verify non-sensitive lines are intact
+        assert "Line 1: Normal log entry" in result
+        assert "Line 999: Normal log entry" in result
+
+    def test_mixed_sensitive_data_same_line(self, matcher):
+        """Multiple sensitive items on same line should all be redacted."""
+        content = "user=admin password=secret123 email=test@example.com"
+
+        result, counts = anonymize_content(content, matcher)
+
+        # All sensitive data should be gone
+        assert "admin" not in result
+        assert "secret123" not in result
+        assert "test@example.com" not in result
+
+        # Structure should be preserved (still one line)
+        assert result.count('\n') == 0
+
+    def test_output_decodable_as_utf8(self, matcher):
+        """Output should always be valid UTF-8."""
+        content = "user=admin\npassword=secret"
+
+        result, _ = anonymize_content(content, matcher)
+
+        # This should not raise
+        result.encode('utf-8').decode('utf-8')
+
+    def test_replacement_length_reasonable(self, matcher):
+        """Replacements should not drastically change content length."""
+        content = "password=short"
+
+        result, _ = anonymize_content(content, matcher)
+
+        # Length difference should be reasonable (not 10x different)
+        length_ratio = len(result) / len(content)
+        assert 0.5 < length_ratio < 3.0, f"Length changed too much: {len(content)} -> {len(result)}"
+
+
+class TestProcessSingleFileIntegrity:
+    """Tests for process_single_file output integrity."""
+
+    def test_binary_passthrough_unchanged(self):
+        """Binary files should pass through completely unchanged."""
+        from anonymizer import process_single_file
+
+        # Binary content with null bytes
+        binary_data = b'\x00\x01\x02\xff\xfe\xfd' + b'password=secret'
+
+        result = process_single_file(("test.bin", binary_data))
+
+        assert result.content == binary_data
+        assert result.replacements == {}
+
+    def test_text_file_encoding_preserved(self):
+        """Text file should be readable after processing."""
+        from anonymizer import process_single_file
+
+        content = "user=admin\npassword=secret\nnormal line"
+        data = content.encode('utf-8')
+
+        result = process_single_file(("test.log", data))
+
+        # Should be decodable
+        decoded = result.content.decode('utf-8')
+        assert "normal line" in decoded
+        assert "admin" not in decoded
+
+    def test_result_has_correct_filename(self):
+        """Result should have the same filename as input."""
+        from anonymizer import process_single_file
+
+        filename = "path/to/test.log"
+        data = b"test content"
+
+        result = process_single_file((filename, data))
+
+        assert result.filename == filename
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

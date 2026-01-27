@@ -40,25 +40,27 @@ TEXT_EXTENSIONS = {
     ".properties",
     ".conf",
     ".config",
-    ".csv",
     ".html",
     ".htm",
 }
 
 # Concurrency limits for memory management
 MAX_CONCURRENT_FUTURES = 8  # Max files in-flight at once (limits memory)
-LARGE_FILE_THRESHOLD = 5 * 1024 * 1024  # 5MB - larger files processed serially in main process
+LARGE_FILE_THRESHOLD = (
+    5 * 1024 * 1024
+)  # 5MB - larger files processed serially in main process
 
 
 class ProgressBar:
     """Simple text-based progress bar."""
 
-    def __init__(self, total: int, description: str = "", width: int = 40):
+    def __init__(self, total: int, description: str = "", width: int = 40, show_eta: bool = True):
         self.total = total
         self.current = 0
         self.description = description
         self.width = width
         self.start_time = time.time()
+        self.show_eta = show_eta
         # Render immediately so progress bar shows right away
         self._render()
 
@@ -83,7 +85,7 @@ class ProgressBar:
         bar = "=" * filled + "-" * (self.width - filled)
 
         elapsed = time.time() - self.start_time
-        if self.current > 0 and self.current < self.total:
+        if self.show_eta and self.current > 0 and self.current < self.total:
             eta = elapsed * (self.total - self.current) / self.current
             time_str = f" ETA: {eta:.0f}s"
         else:
@@ -98,6 +100,46 @@ class ProgressBar:
         self.current = self.total
         self._render()
         print()  # New line
+
+
+class LargeFileProgress:
+    """Progress display for processing large files one at a time."""
+
+    def __init__(self, total_files: int, total_size_mb: float):
+        self.total_files = total_files
+        self.total_size_mb = total_size_mb
+        self.current_file = 0
+        self.start_time = time.time()
+        self.current_file_name = ""
+        self.current_file_size_mb = 0
+        self._render_header()
+
+    def _render_header(self):
+        """Print header for large file processing."""
+        print(f"\nProcessing {self.total_files} large file(s) ({self.total_size_mb:.1f} MB total)")
+        print("Large files are processed serially - this may take several minutes...")
+        print("-" * 60)
+
+    def start_file(self, filename: str, size_bytes: int):
+        """Mark start of processing a new file."""
+        self.current_file += 1
+        self.current_file_name = Path(filename).name
+        self.current_file_size_mb = size_bytes / 1024 / 1024
+        # Truncate long filenames
+        display_name = self.current_file_name[:40] + "..." if len(self.current_file_name) > 43 else self.current_file_name
+        sys.stdout.write(f"\r[{self.current_file}/{self.total_files}] {display_name} ({self.current_file_size_mb:.1f} MB)...")
+        sys.stdout.flush()
+
+    def finish_file(self, replacements: int):
+        """Mark completion of current file."""
+        sys.stdout.write(f" done ({replacements} replacements)\n")
+        sys.stdout.flush()
+
+    def finish(self):
+        """Complete large file processing."""
+        elapsed = time.time() - self.start_time
+        print(f"-" * 60)
+        print(f"Large files completed in {elapsed:.1f}s\n")
 
 
 @dataclass
@@ -248,14 +290,20 @@ def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
             # Phase 2: Process text files with memory-efficient streaming
             if text_entries:
                 # Separate large files (process serially) from small files (process in parallel)
-                large_files = [e for e in text_entries if e.file_size >= LARGE_FILE_THRESHOLD]
-                small_files = [e for e in text_entries if e.file_size < LARGE_FILE_THRESHOLD]
-
-                progress = ProgressBar(len(text_entries), "Anonymizing  ")
+                large_files = [
+                    e for e in text_entries if e.file_size >= LARGE_FILE_THRESHOLD
+                ]
+                small_files = [
+                    e for e in text_entries if e.file_size < LARGE_FILE_THRESHOLD
+                ]
 
                 # Process large files serially in main process (avoids pickle overhead)
                 if large_files:
+                    large_total_mb = sum(e.file_size for e in large_files) / 1024 / 1024
+                    large_progress = LargeFileProgress(len(large_files), large_total_mb)
+
                     for entry in large_files:
+                        large_progress.start_file(entry.filename, entry.file_size)
                         data = src_zip.read(entry.filename)
                         result = process_single_file((entry.filename, data))
 
@@ -265,17 +313,24 @@ def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
                         out_path.write_bytes(result.content)
 
                         # Track stats
+                        file_replacements = sum(result.replacements.values())
                         for cat, count in result.replacements.items():
                             total_stats[cat] += count
                         if result.error:
                             errors.append(f"{result.filename}: {result.error}")
 
+                        large_progress.finish_file(file_replacements)
+
                         # Free memory
                         del data, result
-                        progress.update()
+
+                    large_progress.finish()
 
                 # Process small files in parallel with limited concurrency
                 if small_files:
+                    # Don't show ETA for small files - it's misleading early on
+                    progress = ProgressBar(len(small_files), "Small files  ", show_eta=False)
+
                     with ProcessPoolExecutor(max_workers=max_workers) as executor:
                         pending_futures = {}
                         file_iter = iter(small_files)
@@ -283,7 +338,10 @@ def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
 
                         while not done or pending_futures:
                             # Submit new work up to concurrency limit
-                            while len(pending_futures) < MAX_CONCURRENT_FUTURES and not done:
+                            while (
+                                len(pending_futures) < MAX_CONCURRENT_FUTURES
+                                and not done
+                            ):
                                 try:
                                     entry = next(file_iter)
                                     data = src_zip.read(entry.filename)
@@ -316,7 +374,7 @@ def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
                             del pending_futures[completed]
                             progress.update()
 
-                progress.finish()
+                    progress.finish()
 
         # Calculate timing
         elapsed = time.time() - start_time
