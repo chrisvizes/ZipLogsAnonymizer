@@ -27,6 +27,7 @@ def build():
     # Check if PyInstaller is installed
     try:
         import PyInstaller
+
         print(f"PyInstaller version: {PyInstaller.__version__}")
     except ImportError:
         print("Error: PyInstaller not found.")
@@ -46,16 +47,22 @@ def build():
     # PyInstaller command
     cmd = [
         sys.executable,
-        "-m", "PyInstaller",
-        "--onefile",              # Single executable
-        "--windowed",             # No console window (GUI app)
-        "--name", "ZipLogsAnonymizer",
-        "--add-data", f"pattern_matcher.py{separator}.",  # Include pattern_matcher module
-        "--add-data", f"anonymizer.py{separator}.",       # Include anonymizer module
+        "-m",
+        "PyInstaller",
+        "--onefile",  # Single executable
+        "--windowed",  # No console window (GUI app)
+        "--name",
+        "ZipLogsAnonymizer",
+        "--add-data",
+        f"pattern_matcher.py{separator}.",  # Include pattern_matcher module
+        "--add-data",
+        f"anonymizer.py{separator}.",  # Include anonymizer module
         # Hidden imports that PyInstaller might miss
-        "--hidden-import", "pattern_matcher",
-        "--hidden-import", "anonymizer",
-        "gui.py"
+        "--hidden-import",
+        "pattern_matcher",
+        "--hidden-import",
+        "anonymizer",
+        "gui.py",
     ]
 
     print("\nRunning PyInstaller...")
@@ -77,8 +84,6 @@ def build():
             print("=" * 60)
             print(f"\nExecutable: {exe_path.absolute()}")
             print(f"Size: {size_mb:.1f} MB")
-            print("\nYou can now distribute this file to your colleagues.")
-            print("They just need to double-click it to run - no Python required!")
         else:
             print("\nWarning: Build completed but executable not found.")
     else:
