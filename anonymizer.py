@@ -16,11 +16,16 @@ import sys
 import time
 import zipfile
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed, Future
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable
 import multiprocessing
+
+
+class CancelledException(Exception):
+    """Raised when processing is cancelled by user."""
+    pass
 
 # Import pattern matching
 from pattern_matcher import PatternMatcher, anonymize_content as pattern_anonymize
@@ -220,7 +225,11 @@ def process_single_file(args: tuple[str, bytes]) -> AnonymizationResult:
         return AnonymizationResult(filename, data, {}, error=str(e))
 
 
-def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
+def process_zip(
+    zip_path: str,
+    max_workers: Optional[int] = None,
+    cancel_check: Optional[Callable[[], bool]] = None
+) -> bool:
     """
     Main processing function with streaming writes for memory efficiency.
 
@@ -228,8 +237,18 @@ def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
     - Processes files in batches to limit memory usage
     - Writes results immediately to disk (doesn't store all in memory)
     - Shows progress bar for all phases
+
+    Args:
+        zip_path: Path to the zip file to process
+        max_workers: Number of parallel workers (default: CPU count, max 8)
+        cancel_check: Optional callback that returns True if processing should be cancelled
     """
     import shutil
+
+    def check_cancelled():
+        """Check if cancellation was requested and raise if so."""
+        if cancel_check and cancel_check():
+            raise CancelledException("Processing cancelled by user")
 
     start_time = time.time()
     zip_path = Path(zip_path)
@@ -286,8 +305,10 @@ def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
 
             # Phase 1: Copy binary files directly (no processing needed)
             if binary_entries:
+                check_cancelled()
                 progress = ProgressBar(len(binary_entries), "Copying binary")
                 for entry in binary_entries:
+                    check_cancelled()
                     data = src_zip.read(entry.filename)
                     out_path = output_dir / entry.filename
                     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -307,10 +328,12 @@ def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
 
                 # Process large files serially in main process (avoids pickle overhead)
                 if large_files:
+                    check_cancelled()
                     large_total_mb = sum(e.file_size for e in large_files) / 1024 / 1024
                     large_progress = LargeFileProgress(len(large_files), large_total_mb)
 
                     for entry in large_files:
+                        check_cancelled()
                         large_progress.start_file(entry.filename, entry.file_size)
                         data = src_zip.read(entry.filename)
                         result = process_single_file((entry.filename, data))
@@ -336,51 +359,61 @@ def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
 
                 # Process small files in parallel with limited concurrency
                 if small_files:
+                    check_cancelled()
                     # Don't show ETA for small files - it's misleading early on
                     progress = ProgressBar(len(small_files), "Small files  ", show_eta=False)
 
                     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                        pending_futures = {}
+                        pending_futures: dict[Future, any] = {}
                         file_iter = iter(small_files)
                         done = False
 
-                        while not done or pending_futures:
-                            # Submit new work up to concurrency limit
-                            while (
-                                len(pending_futures) < MAX_CONCURRENT_FUTURES
-                                and not done
-                            ):
-                                try:
-                                    entry = next(file_iter)
-                                    data = src_zip.read(entry.filename)
-                                    future = executor.submit(
-                                        process_single_file, (entry.filename, data)
-                                    )
-                                    pending_futures[future] = entry
-                                except StopIteration:
-                                    done = True
+                        try:
+                            while not done or pending_futures:
+                                # Check for cancellation before submitting more work
+                                check_cancelled()
+
+                                # Submit new work up to concurrency limit
+                                while (
+                                    len(pending_futures) < MAX_CONCURRENT_FUTURES
+                                    and not done
+                                ):
+                                    try:
+                                        entry = next(file_iter)
+                                        data = src_zip.read(entry.filename)
+                                        future = executor.submit(
+                                            process_single_file, (entry.filename, data)
+                                        )
+                                        pending_futures[future] = entry
+                                    except StopIteration:
+                                        done = True
+                                        break
+
+                                if not pending_futures:
                                     break
 
-                            if not pending_futures:
-                                break
+                                # Wait for at least one to complete (with timeout for responsiveness)
+                                for completed in as_completed(pending_futures, timeout=0.5):
+                                    result = completed.result()
 
-                            # Wait for at least one to complete
-                            completed = next(as_completed(pending_futures))
-                            result = completed.result()
+                                    # Write result to disk immediately
+                                    out_path = output_dir / result.filename
+                                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                                    out_path.write_bytes(result.content)
 
-                            # Write result to disk immediately
-                            out_path = output_dir / result.filename
-                            out_path.parent.mkdir(parents=True, exist_ok=True)
-                            out_path.write_bytes(result.content)
+                                    # Track stats
+                                    for cat, count in result.replacements.items():
+                                        total_stats[cat] += count
+                                    if result.error:
+                                        errors.append(f"{result.filename}: {result.error}")
 
-                            # Track stats
-                            for cat, count in result.replacements.items():
-                                total_stats[cat] += count
-                            if result.error:
-                                errors.append(f"{result.filename}: {result.error}")
+                                    del pending_futures[completed]
+                                    progress.update()
+                                    break  # Process one at a time to check cancellation
 
-                            del pending_futures[completed]
-                            progress.update()
+                        except TimeoutError:
+                            # Timeout is expected - just continue loop to check cancellation
+                            pass
 
                     progress.finish()
 

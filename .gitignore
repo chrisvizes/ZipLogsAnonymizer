@@ -1,5 +1,5 @@
 ziplogs*.zip
-ziplogs*
+ziplogs (2)_anonymized
 .claude
 __pycache__
 test_*.zip
@@ -7,3 +7,4 @@ test_*_anonymized*
 create_test_zip.py
 .pytest_cache
 .vscode
+.gitignore
