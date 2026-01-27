@@ -45,9 +45,9 @@ TEXT_EXTENSIONS = {
     ".htm",
 }
 
-# Batch size for processing (limit memory usage)
-BATCH_SIZE = 50  # Process 50 files at a time to limit memory
-MAX_FILE_SIZE_FOR_PARALLEL = 10 * 1024 * 1024  # 10MB - larger files processed serially
+# Concurrency limits for memory management
+MAX_CONCURRENT_FUTURES = 8  # Max files in-flight at once (limits memory)
+LARGE_FILE_THRESHOLD = 5 * 1024 * 1024  # 5MB - larger files processed serially in main process
 
 
 class ProgressBar:
@@ -59,6 +59,8 @@ class ProgressBar:
         self.description = description
         self.width = width
         self.start_time = time.time()
+        # Render immediately so progress bar shows right away
+        self._render()
 
     def update(self, n: int = 1):
         """Update progress by n items."""
@@ -168,11 +170,6 @@ def process_single_file(args: tuple[str, bytes]) -> AnonymizationResult:
         return AnonymizationResult(filename, data, {}, error=str(e))
 
 
-def process_file_chunk(chunk: list[tuple[str, bytes]]) -> list[AnonymizationResult]:
-    """Process a chunk of files in a single worker - reduces pickling overhead."""
-    return [process_single_file(item) for item in chunk]
-
-
 def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
     """
     Main processing function with streaming writes for memory efficiency.
@@ -248,33 +245,64 @@ def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
                     progress.update()
                 progress.finish()
 
-            # Phase 2: Process text files in batches with immediate disk writes
+            # Phase 2: Process text files with memory-efficient streaming
             if text_entries:
-                # Sort by size descending for better load balancing
-                text_entries.sort(key=lambda e: e.file_size, reverse=True)
+                # Separate large files (process serially) from small files (process in parallel)
+                large_files = [e for e in text_entries if e.file_size >= LARGE_FILE_THRESHOLD]
+                small_files = [e for e in text_entries if e.file_size < LARGE_FILE_THRESHOLD]
 
                 progress = ProgressBar(len(text_entries), "Anonymizing  ")
 
-                # Process in batches to limit memory usage
-                with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                    for batch_start in range(0, len(text_entries), BATCH_SIZE):
-                        batch_entries = text_entries[batch_start:batch_start + BATCH_SIZE]
+                # Process large files serially in main process (avoids pickle overhead)
+                if large_files:
+                    for entry in large_files:
+                        data = src_zip.read(entry.filename)
+                        result = process_single_file((entry.filename, data))
 
-                        # Submit batch
-                        futures = {}
-                        for entry in batch_entries:
-                            data = src_zip.read(entry.filename)
-                            future = executor.submit(
-                                process_single_file, (entry.filename, data)
-                            )
-                            futures[future] = entry
+                        # Write immediately
+                        out_path = output_dir / result.filename
+                        out_path.parent.mkdir(parents=True, exist_ok=True)
+                        out_path.write_bytes(result.content)
 
-                        # Process results as they complete and write immediately
-                        for future in as_completed(futures):
-                            result = future.result()
-                            entry = futures[future]
+                        # Track stats
+                        for cat, count in result.replacements.items():
+                            total_stats[cat] += count
+                        if result.error:
+                            errors.append(f"{result.filename}: {result.error}")
 
-                            # Write result to disk immediately (frees memory)
+                        # Free memory
+                        del data, result
+                        progress.update()
+
+                # Process small files in parallel with limited concurrency
+                if small_files:
+                    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                        pending_futures = {}
+                        file_iter = iter(small_files)
+                        done = False
+
+                        while not done or pending_futures:
+                            # Submit new work up to concurrency limit
+                            while len(pending_futures) < MAX_CONCURRENT_FUTURES and not done:
+                                try:
+                                    entry = next(file_iter)
+                                    data = src_zip.read(entry.filename)
+                                    future = executor.submit(
+                                        process_single_file, (entry.filename, data)
+                                    )
+                                    pending_futures[future] = entry
+                                except StopIteration:
+                                    done = True
+                                    break
+
+                            if not pending_futures:
+                                break
+
+                            # Wait for at least one to complete
+                            completed = next(as_completed(pending_futures))
+                            result = completed.result()
+
+                            # Write result to disk immediately
                             out_path = output_dir / result.filename
                             out_path.parent.mkdir(parents=True, exist_ok=True)
                             out_path.write_bytes(result.content)
@@ -285,6 +313,7 @@ def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
                             if result.error:
                                 errors.append(f"{result.filename}: {result.error}")
 
+                            del pending_futures[completed]
                             progress.update()
 
                 progress.finish()
@@ -335,8 +364,6 @@ def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
 
 
 def main():
-    global BATCH_SIZE
-
     parser = argparse.ArgumentParser(
         description="Anonymize sensitive data in log archives.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -349,16 +376,8 @@ def main():
         default=None,
         help="Number of parallel workers (default: CPU count, max 8)",
     )
-    parser.add_argument(
-        "-b",
-        "--batch-size",
-        type=int,
-        default=BATCH_SIZE,
-        help=f"Files per batch (default: {BATCH_SIZE})",
-    )
 
     args = parser.parse_args()
-    BATCH_SIZE = args.batch_size
 
     success = process_zip(args.zipfile, args.workers)
     sys.exit(0 if success else 1)

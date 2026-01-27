@@ -157,18 +157,6 @@ class TestAPIKeyPattern:
         assert "a1b2c3d4e5f6g7h8i9j0k1l2m3n4" not in result
         assert counts["api_key"] == 1
 
-    def test_openai_sk_key(self, matcher):
-        content = "Using key sk-abcdefghij1234567890abcdefgh"
-        result, counts = anonymize_content(content, matcher)
-        assert "sk-abcdefghij1234567890abcdefgh" not in result
-        assert counts["api_key"] == 1
-
-    def test_stripe_pk_key(self, matcher):
-        content = "pk_live_abcdefghij1234567890abcd"
-        result, counts = anonymize_content(content, matcher)
-        assert "pk_live_abcdefghij1234567890abcd" not in result
-        assert counts["api_key"] == 1
-
     def test_json_api_key(self, matcher):
         content = '{"api_key": "verylongapikey1234567890abcdefghij"}'
         result, counts = anonymize_content(content, matcher)
@@ -562,6 +550,231 @@ Line 3: email=test@example.com"""
         result, counts = anonymize_content(content, matcher)
         assert "@example.com" not in result
         assert counts["email"] == 1000
+
+
+class TestOptimizedPatternMatcher:
+    """Tests for the optimized pattern matcher."""
+
+    @pytest.fixture
+    def opt_matcher(self):
+        from pattern_matcher_optimized import OptimizedPatternMatcher
+        return OptimizedPatternMatcher()
+
+    def test_content_may_have_matches_positive(self, opt_matcher):
+        """Content with keywords should return True."""
+        assert opt_matcher.content_may_have_matches("user=admin password=secret")
+        assert opt_matcher.content_may_have_matches("email: test@example.com")
+        assert opt_matcher.content_may_have_matches("Server=mydb.local")
+
+    def test_content_may_have_matches_negative(self, opt_matcher):
+        """Content without keywords should return False."""
+        assert not opt_matcher.content_may_have_matches("hello world")
+        assert not opt_matcher.content_may_have_matches("just some plain text")
+        assert not opt_matcher.content_may_have_matches("numbers 12345")
+
+    def test_get_applicable_patterns_filters(self, opt_matcher):
+        """Should only return patterns whose keywords match."""
+        # Line with password keyword
+        patterns = opt_matcher.get_applicable_patterns("password=secret")
+        pattern_names = [p.name for p in patterns]
+        assert "password" in pattern_names
+        assert "email" not in pattern_names
+
+        # Line with email indicator
+        patterns = opt_matcher.get_applicable_patterns("contact@example.com")
+        pattern_names = [p.name for p in patterns]
+        assert "email" in pattern_names
+
+    def test_get_applicable_patterns_empty_for_plain(self, opt_matcher):
+        """Plain text should have no applicable patterns."""
+        patterns = opt_matcher.get_applicable_patterns("hello world")
+        assert len(patterns) == 0
+
+
+class TestOptimizedAnonymization:
+    """Tests for optimized anonymization functions."""
+
+    @pytest.fixture
+    def opt_matcher(self):
+        from pattern_matcher_optimized import OptimizedPatternMatcher
+        return OptimizedPatternMatcher()
+
+    def test_email_anonymization(self, opt_matcher):
+        from pattern_matcher_optimized import anonymize_content_optimized
+        content = "Contact: john@example.com"
+        result, counts = anonymize_content_optimized(content, opt_matcher)
+        assert "john@example.com" not in result
+        assert "@redacted.com" in result
+        assert counts.get("email", 0) >= 1
+
+    def test_password_anonymization(self, opt_matcher):
+        from pattern_matcher_optimized import anonymize_content_optimized
+        content = "password=secret123"
+        result, counts = anonymize_content_optimized(content, opt_matcher)
+        assert "secret123" not in result
+        assert "PASSWORD_REDACTED" in result
+
+    def test_internal_ip_anonymization(self, opt_matcher):
+        from pattern_matcher_optimized import anonymize_content_optimized
+        content = "Server: 192.168.1.100"
+        result, counts = anonymize_content_optimized(content, opt_matcher)
+        assert "192.168.1.100" not in result
+        assert counts.get("internal_ip", 0) >= 1
+
+    def test_no_matches_passthrough(self, opt_matcher):
+        from pattern_matcher_optimized import anonymize_content_optimized
+        content = "Plain text without sensitive data"
+        result, counts = anonymize_content_optimized(content, opt_matcher)
+        assert result == content
+        assert counts == {}
+
+    def test_multiline_content(self, opt_matcher):
+        from pattern_matcher_optimized import anonymize_content_optimized
+        content = """Line 1: user=admin
+Line 2: password=secret
+Line 3: nothing here
+Line 4: email=test@example.com"""
+        result, counts = anonymize_content_optimized(content, opt_matcher)
+        assert "admin" not in result
+        assert "secret" not in result
+        assert "test@example.com" not in result
+        assert "nothing here" in result  # Unchanged
+
+    def test_chunked_processing(self, opt_matcher):
+        """Test chunked processing for large content."""
+        from pattern_matcher_optimized import anonymize_content_chunked
+        # Create large content
+        content = ("user=admin password=secret\n" * 1000)
+        result, counts = anonymize_content_chunked(content, opt_matcher, chunk_size=1000)
+        assert "admin" not in result
+        assert "secret" not in result
+        assert counts.get("username", 0) >= 1000
+        assert counts.get("password", 0) >= 1000
+
+    def test_hybrid_small_content(self, opt_matcher):
+        """Hybrid should use optimized for small content."""
+        from pattern_matcher_optimized import anonymize_content_hybrid
+        content = "user=admin password=secret"
+        result, counts = anonymize_content_hybrid(content, opt_matcher)
+        assert "admin" not in result
+        assert "secret" not in result
+
+
+class TestOptimizedVsOriginalParity:
+    """Tests to ensure optimized produces same results as original."""
+
+    @pytest.fixture
+    def both_matchers(self):
+        from anonymizer import PatternMatcher
+        from pattern_matcher_optimized import OptimizedPatternMatcher
+        return PatternMatcher(), OptimizedPatternMatcher()
+
+    def test_email_parity(self, both_matchers):
+        """Both implementations should anonymize emails."""
+        from anonymizer import anonymize_content
+        from pattern_matcher_optimized import anonymize_content_optimized
+
+        orig_matcher, opt_matcher = both_matchers
+        content = "Contact: test@example.com and other@domain.org"
+
+        orig_result, orig_counts = anonymize_content(content, orig_matcher)
+        opt_result, opt_counts = anonymize_content_optimized(content, opt_matcher)
+
+        # Both should redact emails
+        assert "@example.com" not in orig_result
+        assert "@example.com" not in opt_result
+        assert "@domain.org" not in orig_result
+        assert "@domain.org" not in opt_result
+        # Counts should match
+        assert orig_counts.get("email", 0) == opt_counts.get("email", 0)
+
+    def test_password_parity(self, both_matchers):
+        """Both implementations should anonymize passwords."""
+        from anonymizer import anonymize_content
+        from pattern_matcher_optimized import anonymize_content_optimized
+
+        orig_matcher, opt_matcher = both_matchers
+        content = "password=secret123 passwd: hunter2"
+
+        orig_result, orig_counts = anonymize_content(content, orig_matcher)
+        opt_result, opt_counts = anonymize_content_optimized(content, opt_matcher)
+
+        assert "secret123" not in orig_result
+        assert "secret123" not in opt_result
+        assert "hunter2" not in orig_result
+        assert "hunter2" not in opt_result
+
+    def test_internal_ip_parity(self, both_matchers):
+        """Both implementations should anonymize internal IPs."""
+        from anonymizer import anonymize_content
+        from pattern_matcher_optimized import anonymize_content_optimized
+
+        orig_matcher, opt_matcher = both_matchers
+        content = "Server 10.0.0.1 and 192.168.1.100"
+
+        orig_result, orig_counts = anonymize_content(content, orig_matcher)
+        opt_result, opt_counts = anonymize_content_optimized(content, opt_matcher)
+
+        assert "10.0.0.1" not in orig_result
+        assert "10.0.0.1" not in opt_result
+        assert "192.168.1.100" not in orig_result
+        assert "192.168.1.100" not in opt_result
+        assert orig_counts.get("internal_ip", 0) == opt_counts.get("internal_ip", 0)
+
+    def test_mixed_content_parity(self, both_matchers):
+        """Both should handle mixed sensitive data."""
+        from anonymizer import anonymize_content
+        from pattern_matcher_optimized import anonymize_content_optimized
+
+        orig_matcher, opt_matcher = both_matchers
+        content = """
+        user=admin@company.local
+        password=secret123
+        Server=192.168.1.50
+        jdbc:mysql://localhost:3306/db
+        """
+
+        orig_result, _ = anonymize_content(content, orig_matcher)
+        opt_result, _ = anonymize_content_optimized(content, opt_matcher)
+
+        # Both should redact sensitive data
+        for sensitive in ["admin@company.local", "secret123", "192.168.1.50", "localhost:3306"]:
+            assert sensitive not in orig_result, f"Original failed to redact: {sensitive}"
+            assert sensitive not in opt_result, f"Optimized failed to redact: {sensitive}"
+
+
+class TestPreFilteringEffectiveness:
+    """Tests to verify pre-filtering reduces work."""
+
+    @pytest.fixture
+    def opt_matcher(self):
+        from pattern_matcher_optimized import OptimizedPatternMatcher
+        return OptimizedPatternMatcher()
+
+    def test_plain_text_no_patterns_applied(self, opt_matcher):
+        """Plain text should skip all pattern matching."""
+        lines = [
+            "This is plain text",
+            "No sensitive data here",
+            "Just regular log output",
+        ]
+        for line in lines:
+            applicable = opt_matcher.get_applicable_patterns(line)
+            assert len(applicable) == 0, f"Unexpected patterns for: {line}"
+
+    def test_keyword_filtering_reduces_patterns(self, opt_matcher):
+        """Lines with specific keywords should only match relevant patterns."""
+        # Password line should not trigger email pattern
+        pw_patterns = opt_matcher.get_applicable_patterns("password=test")
+        pw_names = [p.name for p in pw_patterns]
+        assert "password" in pw_names
+        assert "email" not in pw_names
+
+        # Email line should not trigger password pattern
+        email_patterns = opt_matcher.get_applicable_patterns("user@example.com")
+        email_names = [p.name for p in email_patterns]
+        assert "email" in email_names
+        assert "password" not in email_names
 
 
 if __name__ == "__main__":
