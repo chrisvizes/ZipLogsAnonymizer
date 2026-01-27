@@ -552,13 +552,13 @@ Line 3: email=test@example.com"""
         assert counts["email"] == 1000
 
 
-class TestOptimizedPatternMatcher:
-    """Tests for the optimized pattern matcher."""
+class TestPatternMatcherMethods:
+    """Tests for pattern matcher methods."""
 
     @pytest.fixture
     def opt_matcher(self):
-        from pattern_matcher_optimized import OptimizedPatternMatcher
-        return OptimizedPatternMatcher()
+        from pattern_matcher import PatternMatcher
+        return PatternMatcher()
 
     def test_content_may_have_matches_positive(self, opt_matcher):
         """Content with keywords should return True."""
@@ -591,50 +591,50 @@ class TestOptimizedPatternMatcher:
         assert len(patterns) == 0
 
 
-class TestOptimizedAnonymization:
-    """Tests for optimized anonymization functions."""
+class TestAnonymizationFunctions:
+    """Tests for anonymization functions."""
 
     @pytest.fixture
     def opt_matcher(self):
-        from pattern_matcher_optimized import OptimizedPatternMatcher
-        return OptimizedPatternMatcher()
+        from pattern_matcher import PatternMatcher
+        return PatternMatcher()
 
     def test_email_anonymization(self, opt_matcher):
-        from pattern_matcher_optimized import anonymize_content_optimized
+        from pattern_matcher import anonymize_content
         content = "Contact: john@example.com"
-        result, counts = anonymize_content_optimized(content, opt_matcher)
+        result, counts = anonymize_content(content, opt_matcher)
         assert "john@example.com" not in result
         assert "@redacted.com" in result
         assert counts.get("email", 0) >= 1
 
     def test_password_anonymization(self, opt_matcher):
-        from pattern_matcher_optimized import anonymize_content_optimized
+        from pattern_matcher import anonymize_content
         content = "password=secret123"
-        result, counts = anonymize_content_optimized(content, opt_matcher)
+        result, counts = anonymize_content(content, opt_matcher)
         assert "secret123" not in result
         assert "PASSWORD_REDACTED" in result
 
     def test_internal_ip_anonymization(self, opt_matcher):
-        from pattern_matcher_optimized import anonymize_content_optimized
+        from pattern_matcher import anonymize_content
         content = "Server: 192.168.1.100"
-        result, counts = anonymize_content_optimized(content, opt_matcher)
+        result, counts = anonymize_content(content, opt_matcher)
         assert "192.168.1.100" not in result
         assert counts.get("internal_ip", 0) >= 1
 
     def test_no_matches_passthrough(self, opt_matcher):
-        from pattern_matcher_optimized import anonymize_content_optimized
+        from pattern_matcher import anonymize_content
         content = "Plain text without sensitive data"
-        result, counts = anonymize_content_optimized(content, opt_matcher)
+        result, counts = anonymize_content(content, opt_matcher)
         assert result == content
         assert counts == {}
 
     def test_multiline_content(self, opt_matcher):
-        from pattern_matcher_optimized import anonymize_content_optimized
+        from pattern_matcher import anonymize_content
         content = """Line 1: user=admin
 Line 2: password=secret
 Line 3: nothing here
 Line 4: email=test@example.com"""
-        result, counts = anonymize_content_optimized(content, opt_matcher)
+        result, counts = anonymize_content(content, opt_matcher)
         assert "admin" not in result
         assert "secret" not in result
         assert "test@example.com" not in result
@@ -642,7 +642,7 @@ Line 4: email=test@example.com"""
 
     def test_chunked_processing(self, opt_matcher):
         """Test chunked processing for large content."""
-        from pattern_matcher_optimized import anonymize_content_chunked
+        from pattern_matcher import anonymize_content_chunked
         # Create large content
         content = ("user=admin password=secret\n" * 1000)
         result, counts = anonymize_content_chunked(content, opt_matcher, chunk_size=1000)
@@ -652,81 +652,63 @@ Line 4: email=test@example.com"""
         assert counts.get("password", 0) >= 1000
 
     def test_hybrid_small_content(self, opt_matcher):
-        """Hybrid should use optimized for small content."""
-        from pattern_matcher_optimized import anonymize_content_hybrid
+        """Hybrid should use line-based for small content."""
+        from pattern_matcher import anonymize_content_hybrid
         content = "user=admin password=secret"
         result, counts = anonymize_content_hybrid(content, opt_matcher)
         assert "admin" not in result
         assert "secret" not in result
 
 
-class TestOptimizedVsOriginalParity:
-    """Tests to ensure optimized produces same results as original."""
+class TestAnonymizationConsistency:
+    """Tests to ensure consistent anonymization across different inputs."""
 
     @pytest.fixture
-    def both_matchers(self):
-        from anonymizer import PatternMatcher
-        from pattern_matcher_optimized import OptimizedPatternMatcher
-        return PatternMatcher(), OptimizedPatternMatcher()
+    def matcher(self):
+        from pattern_matcher import PatternMatcher
+        return PatternMatcher()
 
-    def test_email_parity(self, both_matchers):
-        """Both implementations should anonymize emails."""
-        from anonymizer import anonymize_content
-        from pattern_matcher_optimized import anonymize_content_optimized
+    def test_email_anonymization(self, matcher):
+        """Should anonymize emails correctly."""
+        from pattern_matcher import anonymize_content
 
-        orig_matcher, opt_matcher = both_matchers
         content = "Contact: test@example.com and other@domain.org"
 
-        orig_result, orig_counts = anonymize_content(content, orig_matcher)
-        opt_result, opt_counts = anonymize_content_optimized(content, opt_matcher)
+        result, counts = anonymize_content(content, matcher)
 
-        # Both should redact emails
-        assert "@example.com" not in orig_result
-        assert "@example.com" not in opt_result
-        assert "@domain.org" not in orig_result
-        assert "@domain.org" not in opt_result
-        # Counts should match
-        assert orig_counts.get("email", 0) == opt_counts.get("email", 0)
+        # Should redact emails
+        assert "@example.com" not in result
+        assert "@domain.org" not in result
+        # Should have correct count
+        assert counts.get("email", 0) == 2
 
-    def test_password_parity(self, both_matchers):
-        """Both implementations should anonymize passwords."""
-        from anonymizer import anonymize_content
-        from pattern_matcher_optimized import anonymize_content_optimized
+    def test_password_anonymization(self, matcher):
+        """Should anonymize passwords correctly."""
+        from pattern_matcher import anonymize_content
 
-        orig_matcher, opt_matcher = both_matchers
         content = "password=secret123 passwd: hunter2"
 
-        orig_result, orig_counts = anonymize_content(content, orig_matcher)
-        opt_result, opt_counts = anonymize_content_optimized(content, opt_matcher)
+        result, counts = anonymize_content(content, matcher)
 
-        assert "secret123" not in orig_result
-        assert "secret123" not in opt_result
-        assert "hunter2" not in orig_result
-        assert "hunter2" not in opt_result
+        assert "secret123" not in result
+        assert "hunter2" not in result
 
-    def test_internal_ip_parity(self, both_matchers):
-        """Both implementations should anonymize internal IPs."""
-        from anonymizer import anonymize_content
-        from pattern_matcher_optimized import anonymize_content_optimized
+    def test_internal_ip_anonymization(self, matcher):
+        """Should anonymize internal IPs correctly."""
+        from pattern_matcher import anonymize_content
 
-        orig_matcher, opt_matcher = both_matchers
         content = "Server 10.0.0.1 and 192.168.1.100"
 
-        orig_result, orig_counts = anonymize_content(content, orig_matcher)
-        opt_result, opt_counts = anonymize_content_optimized(content, opt_matcher)
+        result, counts = anonymize_content(content, matcher)
 
-        assert "10.0.0.1" not in orig_result
-        assert "10.0.0.1" not in opt_result
-        assert "192.168.1.100" not in orig_result
-        assert "192.168.1.100" not in opt_result
-        assert orig_counts.get("internal_ip", 0) == opt_counts.get("internal_ip", 0)
+        assert "10.0.0.1" not in result
+        assert "192.168.1.100" not in result
+        assert counts.get("internal_ip", 0) == 2
 
-    def test_mixed_content_parity(self, both_matchers):
-        """Both should handle mixed sensitive data."""
-        from anonymizer import anonymize_content
-        from pattern_matcher_optimized import anonymize_content_optimized
+    def test_mixed_content(self, matcher):
+        """Should handle mixed sensitive data."""
+        from pattern_matcher import anonymize_content
 
-        orig_matcher, opt_matcher = both_matchers
         content = """
         user=admin@company.local
         password=secret123
@@ -734,13 +716,11 @@ class TestOptimizedVsOriginalParity:
         jdbc:mysql://localhost:3306/db
         """
 
-        orig_result, _ = anonymize_content(content, orig_matcher)
-        opt_result, _ = anonymize_content_optimized(content, opt_matcher)
+        result, _ = anonymize_content(content, matcher)
 
-        # Both should redact sensitive data
+        # Should redact sensitive data
         for sensitive in ["admin@company.local", "secret123", "192.168.1.50", "localhost:3306"]:
-            assert sensitive not in orig_result, f"Original failed to redact: {sensitive}"
-            assert sensitive not in opt_result, f"Optimized failed to redact: {sensitive}"
+            assert sensitive not in result, f"Failed to redact: {sensitive}"
 
 
 class TestPreFilteringEffectiveness:
@@ -748,8 +728,8 @@ class TestPreFilteringEffectiveness:
 
     @pytest.fixture
     def opt_matcher(self):
-        from pattern_matcher_optimized import OptimizedPatternMatcher
-        return OptimizedPatternMatcher()
+        from pattern_matcher import PatternMatcher
+        return PatternMatcher()
 
     def test_plain_text_no_patterns_applied(self, opt_matcher):
         """Plain text should skip all pattern matching."""
@@ -976,6 +956,30 @@ class TestProcessSingleFileIntegrity:
         result = process_single_file((filename, data))
 
         assert result.filename == filename
+
+
+class TestFormatTime:
+    """Tests for the format_time helper function."""
+
+    def test_seconds_only(self):
+        from anonymizer import format_time
+        assert format_time(5.5) == "5.5s"
+        assert format_time(59.9) == "59.9s"
+        assert format_time(0.1) == "0.1s"
+
+    def test_minutes_and_seconds(self):
+        from anonymizer import format_time
+        assert format_time(60) == "1m 0s"
+        assert format_time(90) == "1m 30s"
+        assert format_time(125.7) == "2m 6s"
+        assert format_time(3599) == "59m 59s"
+
+    def test_hours_minutes_seconds(self):
+        from anonymizer import format_time
+        assert format_time(3600) == "1h 0m 0s"
+        assert format_time(3661) == "1h 1m 1s"
+        assert format_time(7325) == "2h 2m 5s"
+        assert format_time(36000) == "10h 0m 0s"
 
 
 if __name__ == "__main__":

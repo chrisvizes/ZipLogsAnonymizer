@@ -1,0 +1,6 @@
+# Runtime dependencies (none - uses only standard library)
+# All imports (re, tkinter, multiprocessing, etc.) are part of Python's standard library
+
+# Development/Build dependencies
+pytest>=7.0.0        # For running tests
+pyinstaller>=6.0.0   # For building standalone executable

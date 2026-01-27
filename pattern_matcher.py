@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Optimized pattern matching using established techniques from pattern matching research.
+Pattern matching for sensitive data detection and anonymization.
 
-Key optimizations:
+Key techniques:
 1. Pre-filtering with literal keyword checks (O(1) set lookups)
 2. Line-based processing with early exit for non-matching lines
 3. Combined regex patterns where possible to reduce passes
-4. Possessive quantifiers and atomic groups to prevent backtracking
-5. Ordered pattern application (most specific first)
+4. Ordered pattern application (most specific first)
 """
 
 import re
@@ -31,7 +30,7 @@ class PatternConfig:
     multiline: bool = False
 
 
-class OptimizedPatternMatcher:
+class PatternMatcher:
     """
     High-performance pattern matcher using multiple optimization strategies.
 
@@ -312,8 +311,8 @@ class OptimizedPatternMatcher:
         return applicable
 
 
-def anonymize_content_optimized(
-    content: str, matcher: OptimizedPatternMatcher
+def anonymize_content(
+    content: str, matcher: PatternMatcher
 ) -> tuple[str, dict[str, int]]:
     """
     Anonymize content using optimized multi-pass strategy.
@@ -424,7 +423,7 @@ def anonymize_content_optimized(
 
 
 def anonymize_content_hybrid(
-    content: str, matcher: OptimizedPatternMatcher
+    content: str, matcher: PatternMatcher
 ) -> tuple[str, dict[str, int]]:
     """
     Hybrid approach: use line-based for small content, full-pass for large.
@@ -437,14 +436,14 @@ def anonymize_content_hybrid(
     line_count = content.count("\n")
 
     if line_count < LINE_THRESHOLD:
-        return anonymize_content_optimized(content, matcher)
+        return anonymize_content(content, matcher)
     else:
         # For very large files, use chunked processing
         return anonymize_content_chunked(content, matcher)
 
 
 def anonymize_content_chunked(
-    content: str, matcher: OptimizedPatternMatcher, chunk_size: int = 50000
+    content: str, matcher: PatternMatcher, chunk_size: int = 50000
 ) -> tuple[str, dict[str, int]]:
     """
     Process very large content in chunks to maintain cache efficiency.
@@ -452,7 +451,7 @@ def anonymize_content_chunked(
     Chunks are split at line boundaries to avoid breaking patterns.
     """
     if len(content) <= chunk_size:
-        return anonymize_content_optimized(content, matcher)
+        return anonymize_content(content, matcher)
 
     counts: dict[str, int] = defaultdict(int)
     result_parts = []
@@ -468,7 +467,7 @@ def anonymize_content_chunked(
 
         if current_size >= chunk_size:
             chunk_content = "\n".join(current_chunk)
-            chunk_result, chunk_counts = anonymize_content_optimized(
+            chunk_result, chunk_counts = anonymize_content(
                 chunk_content, matcher
             )
             result_parts.append(chunk_result)
@@ -482,7 +481,7 @@ def anonymize_content_chunked(
     # Process remaining
     if current_chunk:
         chunk_content = "\n".join(current_chunk)
-        chunk_result, chunk_counts = anonymize_content_optimized(chunk_content, matcher)
+        chunk_result, chunk_counts = anonymize_content(chunk_content, matcher)
         result_parts.append(chunk_result)
 
         for cat, count in chunk_counts.items():

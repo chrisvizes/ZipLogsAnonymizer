@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""
+ZipLogsAnonymizer GUI - Simple graphical interface for log anonymization.
+
+This provides a user-friendly way to anonymize zip files without using the command line.
+"""
+
+import sys
+import threading
+import tkinter as tk
+from tkinter import ttk, filedialog, scrolledtext
+from pathlib import Path
+import queue
+import os
+
+# Import the core anonymization logic
+from anonymizer import process_zip, TEXT_EXTENSIONS
+
+
+class RedirectText:
+    """Redirect stdout/stderr to a tkinter text widget."""
+
+    def __init__(self, text_widget, message_queue):
+        self.text_widget = text_widget
+        self.message_queue = message_queue
+
+    def write(self, string):
+        self.message_queue.put(string)
+
+    def flush(self):
+        pass
+
+
+class AnonymizerGUI:
+    """Main GUI application for ZipLogsAnonymizer."""
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("ZipLogsAnonymizer")
+        self.root.geometry("700x500")
+        self.root.minsize(600, 400)
+
+        # Message queue for thread-safe UI updates
+        self.message_queue = queue.Queue()
+
+        # Track processing state
+        self.processing = False
+        self.output_dir = None
+
+        self._create_widgets()
+        self._setup_output_redirect()
+        self._process_queue()
+
+    def _create_widgets(self):
+        """Create all GUI widgets."""
+        # Main container with padding
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky="nsew")
+
+        # Configure grid weights for resizing
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(2, weight=1)
+
+        # Header
+        header_frame = ttk.Frame(main_frame)
+        header_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+
+        title_label = ttk.Label(
+            header_frame,
+            text="ZipLogsAnonymizer",
+            font=("Segoe UI", 16, "bold")
+        )
+        title_label.pack(anchor="w")
+
+        desc_label = ttk.Label(
+            header_frame,
+            text="Anonymize sensitive data in log archives for safe sharing",
+            font=("Segoe UI", 9)
+        )
+        desc_label.pack(anchor="w")
+
+        # File selection frame
+        file_frame = ttk.LabelFrame(main_frame, text="Select Zip File", padding="10")
+        file_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        file_frame.columnconfigure(0, weight=1)
+
+        self.file_path_var = tk.StringVar()
+        self.file_entry = ttk.Entry(file_frame, textvariable=self.file_path_var, state="readonly")
+        self.file_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+
+        self.browse_button = ttk.Button(file_frame, text="Browse...", command=self._browse_file)
+        self.browse_button.grid(row=0, column=1)
+
+        # Supported formats hint
+        formats = ", ".join(sorted(TEXT_EXTENSIONS))
+        hint_label = ttk.Label(
+            file_frame,
+            text=f"Text formats processed: {formats}",
+            font=("Segoe UI", 8),
+            foreground="gray"
+        )
+        hint_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(5, 0))
+
+        # Output area
+        output_frame = ttk.LabelFrame(main_frame, text="Progress", padding="10")
+        output_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
+        output_frame.columnconfigure(0, weight=1)
+        output_frame.rowconfigure(0, weight=1)
+
+        self.output_text = scrolledtext.ScrolledText(
+            output_frame,
+            wrap=tk.WORD,
+            font=("Consolas", 9),
+            height=15,
+            state="disabled"
+        )
+        self.output_text.grid(row=0, column=0, sticky="nsew")
+
+        # Button frame
+        button_frame = ttk.Frame(main_frame)
+        button_frame.grid(row=3, column=0, sticky="ew")
+
+        self.process_button = ttk.Button(
+            button_frame,
+            text="Anonymize",
+            command=self._start_processing,
+            state="disabled"
+        )
+        self.process_button.pack(side="left")
+
+        self.open_folder_button = ttk.Button(
+            button_frame,
+            text="Open Output Folder",
+            command=self._open_output_folder,
+            state="disabled"
+        )
+        self.open_folder_button.pack(side="left", padx=(10, 0))
+
+        # Status bar
+        self.status_var = tk.StringVar(value="Select a zip file to begin")
+        status_bar = ttk.Label(
+            main_frame,
+            textvariable=self.status_var,
+            font=("Segoe UI", 9),
+            foreground="gray"
+        )
+        status_bar.grid(row=4, column=0, sticky="w", pady=(5, 0))
+
+    def _setup_output_redirect(self):
+        """Redirect stdout to the output text widget."""
+        self.redirector = RedirectText(self.output_text, self.message_queue)
+
+    def _process_queue(self):
+        """Process messages from the queue and update the text widget."""
+        try:
+            while True:
+                message = self.message_queue.get_nowait()
+                self.output_text.configure(state="normal")
+
+                # Handle carriage return for progress bar updates
+                if message.startswith('\r'):
+                    # Delete the current line and insert new content
+                    self.output_text.delete("end-1c linestart", "end-1c")
+                    message = message[1:]  # Remove the \r
+
+                self.output_text.insert(tk.END, message)
+                self.output_text.see(tk.END)
+                self.output_text.configure(state="disabled")
+        except queue.Empty:
+            pass
+
+        # Schedule next check
+        self.root.after(50, self._process_queue)
+
+    def _browse_file(self):
+        """Open file dialog to select a zip file."""
+        filename = filedialog.askopenfilename(
+            title="Select Zip File",
+            filetypes=[
+                ("Zip files", "*.zip"),
+                ("All files", "*.*")
+            ]
+        )
+
+        if filename:
+            self.file_path_var.set(filename)
+            self.process_button.configure(state="normal")
+            self.status_var.set(f"Selected: {Path(filename).name}")
+            self.open_folder_button.configure(state="disabled")
+            self.output_dir = None
+
+            # Clear previous output
+            self.output_text.configure(state="normal")
+            self.output_text.delete(1.0, tk.END)
+            self.output_text.configure(state="disabled")
+
+    def _start_processing(self):
+        """Start the anonymization process in a background thread."""
+        if self.processing:
+            return
+
+        zip_path = self.file_path_var.get()
+        if not zip_path:
+            return
+
+        self.processing = True
+        self.process_button.configure(state="disabled")
+        self.browse_button.configure(state="disabled")
+        self.open_folder_button.configure(state="disabled")
+        self.status_var.set("Processing...")
+
+        # Calculate expected output directory
+        zip_file = Path(zip_path)
+        self.output_dir = zip_file.parent / (zip_file.stem + "_anonymized")
+
+        # Clear output
+        self.output_text.configure(state="normal")
+        self.output_text.delete(1.0, tk.END)
+        self.output_text.configure(state="disabled")
+
+        # Start processing in background thread
+        thread = threading.Thread(target=self._process_file, args=(zip_path,), daemon=True)
+        thread.start()
+
+    def _process_file(self, zip_path):
+        """Process the file (runs in background thread)."""
+        # Redirect stdout to our text widget
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        sys.stdout = self.redirector
+        sys.stderr = self.redirector
+
+        try:
+            success = process_zip(zip_path)
+
+            # Schedule UI update on main thread
+            self.root.after(0, lambda: self._processing_complete(success))
+
+        except Exception as e:
+            print(f"\nError: {e}")
+            self.root.after(0, lambda: self._processing_complete(False))
+
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+
+    def _processing_complete(self, success):
+        """Called when processing is complete."""
+        self.processing = False
+        self.process_button.configure(state="normal")
+        self.browse_button.configure(state="normal")
+
+        if success and self.output_dir and self.output_dir.exists():
+            self.status_var.set("Complete! Output ready.")
+            self.open_folder_button.configure(state="normal")
+        else:
+            self.status_var.set("Processing failed. Check output for details.")
+            self.output_dir = None
+
+    def _open_output_folder(self):
+        """Open the output folder in file explorer."""
+        if self.output_dir and self.output_dir.exists():
+            # Cross-platform folder open
+            if sys.platform == "win32":
+                os.startfile(self.output_dir)
+            elif sys.platform == "darwin":
+                os.system(f'open "{self.output_dir}"')
+            else:
+                os.system(f'xdg-open "{self.output_dir}"')
+
+
+def main():
+    """Main entry point for the GUI application."""
+    root = tk.Tk()
+
+    # Set app icon if available
+    try:
+        # On Windows, you could set an icon here
+        pass
+    except Exception:
+        pass
+
+    app = AnonymizerGUI(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

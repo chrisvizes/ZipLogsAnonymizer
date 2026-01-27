@@ -22,11 +22,8 @@ from pathlib import Path
 from typing import Optional
 import multiprocessing
 
-# Import optimized pattern matching
-from pattern_matcher_optimized import (
-    OptimizedPatternMatcher,
-    anonymize_content_optimized,
-)
+# Import pattern matching
+from pattern_matcher import PatternMatcher, anonymize_content as pattern_anonymize
 
 
 # File extensions to process as text
@@ -49,6 +46,21 @@ MAX_CONCURRENT_FUTURES = 8  # Max files in-flight at once (limits memory)
 LARGE_FILE_THRESHOLD = (
     5 * 1024 * 1024
 )  # 5MB - larger files processed serially in main process
+
+
+def format_time(seconds: float) -> str:
+    """Format seconds into human-readable time string."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = seconds % 60
+        return f"{minutes}m {secs:.0f}s"
+    else:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = seconds % 60
+        return f"{hours}h {minutes}m {secs:.0f}s"
 
 
 class ProgressBar:
@@ -87,9 +99,9 @@ class ProgressBar:
         elapsed = time.time() - self.start_time
         if self.show_eta and self.current > 0 and self.current < self.total:
             eta = elapsed * (self.total - self.current) / self.current
-            time_str = f" ETA: {eta:.0f}s"
+            time_str = f" ETA: {format_time(eta)}"
         else:
-            time_str = f" {elapsed:.1f}s"
+            time_str = f" {format_time(elapsed)}"
 
         line = f"\r{self.description}: [{bar}] {pct:3d}% ({self.current}/{self.total}){time_str}"
         sys.stdout.write(line)
@@ -138,8 +150,8 @@ class LargeFileProgress:
     def finish(self):
         """Complete large file processing."""
         elapsed = time.time() - self.start_time
-        print(f"-" * 60)
-        print(f"Large files completed in {elapsed:.1f}s\n")
+        print("-" * 60)
+        print(f"Large files completed in {format_time(elapsed)}\n")
 
 
 @dataclass
@@ -152,18 +164,14 @@ class AnonymizationResult:
     error: Optional[str] = None
 
 
-# Alias for backwards compatibility with tests
-PatternMatcher = OptimizedPatternMatcher
-
-
 # Global pattern matcher (compiled once per process)
-_matcher: Optional[OptimizedPatternMatcher] = None
+_matcher: Optional[PatternMatcher] = None
 
 
-def get_matcher() -> OptimizedPatternMatcher:
+def get_matcher() -> PatternMatcher:
     global _matcher
     if _matcher is None:
-        _matcher = OptimizedPatternMatcher()
+        _matcher = PatternMatcher()
     return _matcher
 
 
@@ -177,13 +185,13 @@ def is_likely_binary(data: bytes, sample_size: int = 8192) -> bool:
 
 
 def anonymize_content(
-    content: str, matcher: OptimizedPatternMatcher
+    content: str, matcher: PatternMatcher
 ) -> tuple[str, dict[str, int]]:
-    """Anonymize content using optimized pattern matching.
+    """Anonymize content using pattern matching.
 
     Returns (anonymized_content, category -> count).
     """
-    return anonymize_content_optimized(content, matcher)
+    return pattern_anonymize(content, matcher)
 
 
 def process_single_file(args: tuple[str, bytes]) -> AnonymizationResult:
@@ -378,7 +386,6 @@ def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
 
         # Calculate timing
         elapsed = time.time() - start_time
-        minutes, seconds = divmod(elapsed, 60)
 
         # Print results
         print("\n" + "=" * 60)
@@ -387,11 +394,7 @@ def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
         print(f"\nOutput directory: {output_dir}")
         print(f"Original zip size: {zip_path.stat().st_size / 1024 / 1024:.1f} MB")
         print(f"Files processed: {total_files}")
-
-        if minutes > 0:
-            print(f"Total time: {int(minutes)}m {seconds:.1f}s")
-        else:
-            print(f"Total time: {seconds:.1f}s")
+        print(f"Total time: {format_time(elapsed)}")
 
         if total_stats:
             print(f"\nReplacements made:")

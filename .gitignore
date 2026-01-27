@@ -3,7 +3,7 @@ ziplogs*
 .claude
 __pycache__
 test_*.zip
-test_small*
+test_*_anonymized*
 create_test_zip.py
 .pytest_cache
 .vscode
