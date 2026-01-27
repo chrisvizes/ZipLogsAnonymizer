@@ -1,99 +1,235 @@
-## The Scenario
+# ZipLogsAnonymizer
 
-1. Sharing logs to cloud LLMs is poor practice in terms of data security
-2. Claude Code is really good at digging through a directory of logs to find issues
-3. If we could remove all sensitive data from the logs, we may have an effective DESK tool on our hands
+Anonymize sensitive data in log archives for safe sharing with LLMs and external parties.
 
-## What is the ziplogs.zip?
+This tool processes zip files containing logs (typically from Tableau Server or similar systems) and replaces sensitive information with safe placeholders, allowing you to share logs for troubleshooting without exposing credentials, internal infrastructure details, or personal information.
 
-This project works on a zip file that contains logs and other information. This will typically be from a Tableau Server, but may also be from other tools like Tableau Servers Resource Management Tool. It should work on any zip file of logs. These zip files will have varying structures. The folder structure for Tableau Server is typically something like
+---
+
+## Quick Start (For Users)
+
+### Download and Run
+
+1. Download `ZipLogsAnonymizer.exe` from the [Releases](../../releases) page
+2. Double-click to launch the application
+3. Click **Browse** and select your zip file
+4. Click **Anonymize** and wait for processing
+5. Click **Open Output Folder** to access your anonymized logs
+
+The tool creates a folder named `<your-zip>_anonymized` containing all files with sensitive data redacted. The original zip file is not modified.
+
+**No Python or technical setup required.**
+
+---
+
+## What Gets Anonymized
+
+The following sensitive data patterns are detected and replaced:
+
+### Credentials & Secrets
+
+| Data Type | Detection Method | Example | Replacement |
+|-----------|------------------|---------|-------------|
+| Passwords | Context keywords (`password=`, `pwd=`, `passwd:`, `secret=`) | `password=hunter2` | `password=PASSWORD_REDACTED` |
+| API Keys/Tokens | Context keywords + length check (20+ chars) | `api_key=sk_live_abc123...` | `API_KEY_REDACTED` |
+| Authorization Headers | `Authorization: Bearer/Basic/Digest` patterns | `Authorization: Bearer eyJ...` | `Authorization: Bearer AUTH_TOKEN_REDACTED` |
+| Private Keys | PEM format markers | `-----BEGIN PRIVATE KEY-----` | `PRIVATE_KEY_REDACTED` |
+| Certificates | PEM format markers | `-----BEGIN CERTIFICATE-----` | `CERTIFICATE_REDACTED` |
+
+### Personal Information
+
+| Data Type | Detection Method | Example | Replacement |
+|-----------|------------------|---------|-------------|
+| Email Addresses | Standard email regex | `john.doe@company.com` | `EMAIL_001@redacted.com` |
+| Usernames | Context keywords (`user=`, `username:`, `login=`) | `user=jsmith` | `user=USERNAME_001` |
+| SSNs | Format `###-##-####` | `123-45-6789` | `SSN_REDACTED` |
+
+### Network & Infrastructure
+
+| Data Type | Detection Method | Example | Replacement |
+|-----------|------------------|---------|-------------|
+| Internal IPs | Private IP ranges (10.x, 192.168.x, 172.16-31.x) | `192.168.1.100` | `INTERNAL_IP_001` |
+| Internal Hostnames | `.local`, `.internal`, `.corp`, `.lan`, `.intranet`, `.private` domains | `server.corp` | `HOSTNAME_001.redacted` |
+| UNC Paths | `\\server\share` pattern | `\\fileserver\data` | `\\REDACTED_SERVER\REDACTED_SHARE` |
+| MAC Addresses | Standard MAC format | `00:1A:2B:3C:4D:5E` | `MAC_REDACTED` |
+| Database Connections | JDBC URLs and connection strings | `jdbc:mysql://db:3306/prod` | `DB_REDACTED` |
+
+### Tableau-Specific
+
+| Data Type | Detection Method | Example | Replacement |
+|-----------|------------------|---------|-------------|
+| Site Names | `site=` context | `site=CustomerPortal` | `site=TABLEAU_ENTITY_001` |
+| Workbook Names | `workbook=` context | `workbook=SalesReport` | `workbook=TABLEAU_ENTITY_002` |
+| Datasource Names | `datasource=` context | `datasource=ProductionDB` | `datasource=TABLEAU_ENTITY_003` |
+| Project Names | `project=` context | `project=Finance` | `project=TABLEAU_ENTITY_004` |
+
+### Consistency Guarantee
+
+The same original value always maps to the same replacement throughout all files:
+- `john@company.com` → `EMAIL_001@redacted.com` (every occurrence)
+- `192.168.1.50` → `INTERNAL_IP_001` (every occurrence)
+
+This preserves the ability to trace issues across log files while hiding the actual values.
+
+---
+
+## What Is NOT Anonymized
+
+The following are **intentionally not modified** and may still contain sensitive information:
+
+| Data Type | Why Not Included | Risk Level |
+|-----------|------------------|------------|
+| **External/Public IPs** | Often needed for debugging connectivity issues; less sensitive than internal infrastructure | Medium |
+| **Phone Numbers** | High false-positive rate (version numbers, ports, timestamps look similar) | Low-Medium |
+| **Full Names** | Extremely difficult to detect reliably without a name database | Medium |
+| **Custom Application Data** | Business-specific data in JSON/XML payloads is unpredictable | Varies |
+| **File Paths** | Local paths like `C:\Users\...` may reveal usernames but are often needed for debugging | Low |
+| **Timestamps** | Required for log analysis | None |
+| **Error Messages** | Required for debugging | Low |
+| **Stack Traces** | Required for debugging | Low |
+
+**Recommendation:** Review the anonymized output before sharing if you have specific concerns about data not in the "What Gets Anonymized" list above.
+
+---
+
+## How It Works
+
+### Processing Pipeline
 
 ```
-ziplogs.zip
--> nodes
-->-> processes
-->->-> config
-->->-> logs
-->->->-> .log and .txt log files
-->->-> manifest.json
+┌─────────────┐     ┌──────────────┐     ┌─────────────┐     ┌──────────────┐
+│  Input Zip  │ ──► │ Categorize   │ ──► │ Anonymize   │ ──► │ Output Dir   │
+│   File      │     │ Files        │     │ Text Files  │     │ (unzipped)   │
+└─────────────┘     └──────────────┘     └─────────────┘     └──────────────┘
+                           │                    │
+                           ▼                    ▼
+                    Binary files         Text files scanned
+                    copied as-is         for sensitive patterns
 ```
 
-## What can't we share?
+1. **File Categorization**: Files are sorted into text (`.log`, `.txt`, `.json`, `.xml`, `.yml`, `.yaml`, `.properties`, `.conf`, `.config`, `.html`) and binary (everything else)
 
-Defining what it is we need to sanitize is critical to make this script effective but not immediately obvious.
+2. **Binary Passthrough**: Binary files (images, compiled files, etc.) are copied unchanged
 
-### 1. Personal Identifiable Information (PII)
+3. **Text Processing**: Each text file is scanned line-by-line for sensitive patterns using optimized regex matching
 
-| What to find    | Detection strategy                                                                 | Replacement                                           |
-| --------------- | ---------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| Email addresses | Regex: `[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`                            | `USER_EMAIL_001@redacted.com` (incrementing)          |
-| Phone numbers   | Regex for common formats: `\+?[\d\s\-\(\)]{10,}`                                   | `PHONE_REDACTED`                                      |
-| Usernames       | Context-based: look for `user=`, `username:`, login fields                         | `USER_001` (incrementing, consistent per unique user) |
-| Full names      | Difficult - match against common name lists or patterns after `name=`, `fullname:` | `PERSON_001` (incrementing)                           |
+4. **Immediate Write**: Processed files are written to disk immediately (not held in memory)
 
-> **Note:** Removing email addresses will be frustrating as sometimes we give advice that relates to specific users. However, we can manually search through the unsanitized logs to get this info when needed.
+5. **Cleanup on Failure**: If processing fails partway through, the incomplete output directory is deleted to prevent accidental use of partially-anonymized data
 
-### 2. Credentials & Secrets
+### Performance Optimizations
 
-| What to find                | Detection strategy                                                                                   | Replacement              |
-| --------------------------- | ---------------------------------------------------------------------------------------------------- | ------------------------ |
-| Passwords                   | Regex for `password=`, `pwd=`, `passwd:` followed by values                                          | `PASSWORD_REDACTED`      |
-| API keys                    | Regex for common patterns: long alphanumeric strings (32+ chars), patterns like `sk-`, `pk_`, `api_` | `API_KEY_REDACTED`       |
-| Session tokens              | Look for `session=`, `token=`, `jwt=`, `bearer` headers                                              | `TOKEN_REDACTED`         |
-| Authorization headers       | Regex: `Authorization:\s*(Basic\|Bearer\|Digest)\s+[^\s]+`                                           | `AUTH_HEADER_REDACTED`   |
-| Database connection strings | Patterns with `jdbc:`, `Server=`, `Data Source=`, containing credentials                             | `DB_CONNECTION_REDACTED` |
-| Private keys                | Multi-line patterns: `-----BEGIN (RSA\|DSA\|EC\|PRIVATE) KEY-----`                                   | `PRIVATE_KEY_REDACTED`   |
-| Certificates                | Patterns: `-----BEGIN CERTIFICATE-----`                                                              | `CERTIFICATE_REDACTED`   |
+The tool is designed to handle large log archives (500MB - 2GB zips containing thousands of files):
 
-### 3. Network & Infrastructure
+| Challenge | Solution |
+|-----------|----------|
+| **Memory usage** | Stream processing - files are read, processed, and written one at a time rather than loading the entire zip into memory |
+| **Large files (>5MB)** | Processed serially in the main process to avoid overhead of serializing large data to worker processes |
+| **Small files** | Processed in parallel across multiple CPU cores (up to 8 workers) |
+| **Regex performance** | Pre-filtering with keyword checks - lines without relevant keywords (like `@`, `password`, `jdbc:`) skip regex entirely, reducing work by ~5x |
+| **Pattern matching** | Line-by-line processing with early exit - each line only runs against patterns whose keywords appear in that line |
 
-| What to find          | Detection strategy                                                                                            | Replacement                            |
-| --------------------- | ------------------------------------------------------------------------------------------------------------- | -------------------------------------- |
-| Internal IP addresses | Regex for private ranges: `10\.\d+\.\d+\.\d+`, `192\.168\.\d+\.\d+`, `172\.(1[6-9]\|2[0-9]\|3[01])\.\d+\.\d+` | `INTERNAL_IP_001` (consistent mapping) |
-| External IP addresses | General IPv4 regex (excluding private): `\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`                              | `EXTERNAL_IP_001` (consistent mapping) |
-| IPv6 addresses        | Regex for IPv6 patterns                                                                                       | `IPV6_REDACTED`                        |
-| Internal hostnames    | Patterns matching corporate naming conventions, `.local`, `.internal`, `.corp` domains                        | `HOST_001` (consistent mapping)        |
-| Server paths          | UNC paths `\\\\server\\share`, absolute paths with server names                                               | `\\REDACTED_SERVER\REDACTED_PATH`      |
-| MAC addresses         | Regex: `([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}`                                                                | `MAC_REDACTED`                         |
+### Architecture
 
-### 4. Tableau-Specific Sensitive Data
+```
+ZipLogsAnonymizer/
+├── gui.py              # GUI application (tkinter) - user interface
+├── anonymizer.py       # Main processing logic - file handling, parallelization
+├── pattern_matcher.py  # Pattern definitions and matching logic
+├── test_anonymizer.py  # Test suite (105 tests)
+├── build.py            # Build script for creating executable
+└── requirements.txt    # Python dependencies
+```
 
-| What to find              | Detection strategy                   | Replacement                                    |
-| ------------------------- | ------------------------------------ | ---------------------------------------------- |
-| Workbook/datasource names | May contain business context         | `Workbook/Datasource_001` (consistent mapping) |
-| Site names                | Look for `site=`, site ID references | `SITE_001` (consistent mapping)                |
-| Project names             | Project references in logs           | `PROJECT_001` (consistent mapping)             |
-| License keys              | Tableau license patterns             | `LICENSE_REDACTED`                             |
-| Customer database names   | Look for datasource connection info  | `DATABASE_001` (consistent mapping)            |
+- **`pattern_matcher.py`**: Defines all sensitive data patterns with their regex, replacement text, and required keywords for pre-filtering
+- **`anonymizer.py`**: Handles zip extraction, file categorization, parallel processing, progress display, and output writing
+- **`gui.py`**: Provides the graphical interface wrapping the core logic
 
-### Replacement Strategy Principles
+---
 
-1. **Consistency:** The same original value should always map to the same replacement (e.g., `john@company.com` always becomes `USER_EMAIL_001@redacted.com` throughout all files)
-2. **Uniqueness:** Different original values get different replacements to preserve log readability (debugging still needs to distinguish between different users/servers)
-3. **Context preservation:** Keep enough structure that logs remain parseable (e.g., email format stays as email format)
+## For Developers
 
-## How do we prove it works?
+### Setup
 
-Do we need some kind of script, perhaps built by someone else, that looks for the information we are trying to remove?
+```bash
+# Clone the repository
+git clone <repo-url>
+cd ZipLogsAnonymizer
 
-Unit tests for each individual find and replace could improve our trust in their function
+# Install development dependencies
+pip install -r requirements.txt
+```
 
-## What could the general structure of the process be?
+### Running Tests
 
-1. User pulls git repo of ZipLogsAnonymizer
-2. They run `ZipLogsAnonymizer <directory of ziplogs>`
-3. The script unzips the directory of logs
-   1. Iterates through each text file (log, txt, json) in the new directory
-   2. Replaces all sensitive strings with a generic placeholder
-   3. **If it fails at any point, deletes the directory it just made that may have incomplete sanitizing**
-   4. Updates the user on its progress as it runs and confirms the result at the end.
-      1. Reading out what kind of sensitive information was replaced and how many times would be a useful confirmation of parsing
-   5. The unzipped directory of logs in the original structure is left for the user with anonymized logs
+The project includes 105 tests covering pattern matching, edge cases, and output integrity:
 
-## Challenges for the script
+```bash
+pytest test_anonymizer.py -v
+```
 
-1. Volume of files to process
-   1. A typical logs dump can be from 500MB to 2GB as a zip file containing several thousand log files
-   2. To process 5K log files in 10 minutes, you'd need to process 8 per second
-   3. The unzipped logs could be 5-10GB
-   4. Pattern matching with Regex can be computationally expensive
+### Adding New Patterns
+
+To add a new sensitive data pattern, edit `pattern_matcher.py`:
+
+```python
+# In PatternMatcher._compile_patterns(), add:
+patterns.append(
+    PatternConfig(
+        name="my_new_pattern",           # Category name for reporting
+        pattern=re.compile(r"..."),      # Regex to match
+        replacement="REDACTED",          # Replacement text (use \1 for groups)
+        uses_groups=False,               # True if replacement uses capture groups
+        required_keywords=frozenset(["keyword1", "keyword2"]),  # For pre-filtering
+        multiline=False,                 # True for patterns spanning multiple lines
+    )
+)
+```
+
+**Important**: Add corresponding tests in `test_anonymizer.py` to verify the pattern works correctly.
+
+### Command Line Usage
+
+For scripting or automation without the GUI:
+
+```bash
+python anonymizer.py <path-to-zip-file>
+
+# Options:
+#   -w, --workers N    Number of parallel workers (default: CPU count, max 8)
+```
+
+### Building the Executable
+
+To create a standalone `.exe` for distribution:
+
+```bash
+# Install PyInstaller
+pip install pyinstaller
+
+# Run the build script
+python build.py
+```
+
+This creates `dist/ZipLogsAnonymizer.exe` (~11MB) that runs without Python installed.
+
+### Contributing
+
+1. Add tests for any new patterns or features
+2. Run the full test suite before submitting changes
+3. Update this README if adding new pattern categories
+
+---
+
+## Limitations
+
+- **Not a security guarantee**: This tool reduces risk but cannot guarantee all sensitive data is removed. Always review output for highly sensitive use cases.
+- **Text files only**: Binary files are copied unchanged. Embedded text in binaries (e.g., SQLite databases) is not processed.
+- **English-centric patterns**: Some patterns (like name detection if added) may not work well for non-English content.
+- **No undo**: The original zip is preserved, but if you delete it, there's no way to recover the original data from the anonymized output.
+
+---
+
+## License
+
+Internal use only.
