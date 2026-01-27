@@ -96,3 +96,4 @@ Unit tests for each individual find and replace could improve our trust in their
    1. A typical logs dump can be from 500MB to 2GB as a zip file containing several thousand log files
    2. To process 5K log files in 10 minutes, you'd need to process 8 per second
    3. The unzipped logs could be 5-10GB
+   4. Pattern matching with Regex can be computationally expensive
