@@ -11,7 +11,6 @@ Optimized for large zip files (up to 2GB) with:
 """
 
 import argparse
-import os
 import re
 import sys
 import zipfile
@@ -110,9 +109,7 @@ class PatternMatcher:
                 "api_key",
                 re.compile(
                     r"((?:api[_-]?key|token|bearer)\s*[=:]\s*)[a-zA-Z0-9_-]{20,}|"
-                    r'("(?:api[_-]?key|token)"\s*:\s*")[^"]{20,}|'
-                    r"\b(sk-[a-zA-Z0-9]{20,})\b|"
-                    r"\b(pk_[a-zA-Z0-9_]{20,})\b",
+                    r'("(?:api[_-]?key|token)"\s*:\s*")[^"]{20,}',
                     re.IGNORECASE,
                 ),
                 "API_KEY_REDACTED",
@@ -424,43 +421,38 @@ def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
             # Sort text files by size descending - process largest first for better load balancing
             text_entries.sort(key=lambda e: e.file_size, reverse=True)
 
-            # Read all text file data
-            print("Reading text files...")
-            sys.stdout.flush()
-            file_data = []
-            for entry in text_entries:
-                data = src_zip.read(entry.filename)
-                file_data.append((entry.filename, data))
-
-            # Split into chunks for each worker (reduces pickle overhead)
+            # Process text files with continuous task submission for better parallelism
             print("Anonymizing text files...")
             sys.stdout.flush()
-
-            # Distribute files round-robin across workers to balance load
-            # (since sorted by size, this spreads large files across workers)
-            chunks = [[] for _ in range(max_workers)]
-            for i, item in enumerate(file_data):
-                chunks[i % max_workers].append(item)
-            chunks = [c for c in chunks if c]  # Remove empty chunks
-
+            processed = 0
             results = {}
+
+            # Use a single executor for all files - submit all tasks upfront
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                # Submit chunks to workers
-                futures = {executor.submit(process_file_chunk, chunk): i for i, chunk in enumerate(chunks)}
+                # Submit all files as individual tasks
+                futures = {}
+                for entry in text_entries:
+                    data = src_zip.read(entry.filename)
+                    future = executor.submit(
+                        process_single_file, (entry.filename, data)
+                    )
+                    futures[future] = entry.filename
 
-                processed = 0
+                # Collect results as they complete
                 for future in as_completed(futures):
-                    chunk_results = future.result()
-                    for result in chunk_results:
-                        results[result.filename] = result
-                        for cat, count in result.replacements.items():
-                            total_stats[cat] += count
-                        if result.error:
-                            errors.append(f"{result.filename}: {result.error}")
-                        processed += 1
+                    result = future.result()
+                    results[result.filename] = result
+                    for cat, count in result.replacements.items():
+                        total_stats[cat] += count
+                    if result.error:
+                        errors.append(f"{result.filename}: {result.error}")
 
-                    print(f"  Processed {processed}/{len(text_entries)} text files...")
-                    sys.stdout.flush()
+                    processed += 1
+                    if processed % 50 == 0 or processed == len(text_entries):
+                        print(
+                            f"  Processed {processed}/{len(text_entries)} text files..."
+                        )
+                        sys.stdout.flush()
 
             # Write all results to output directory
             print("Writing output files...")
