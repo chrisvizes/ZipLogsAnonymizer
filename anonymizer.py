@@ -112,7 +112,7 @@ class PatternMatcher:
                     r"((?:api[_-]?key|token|bearer)\s*[=:]\s*)[a-zA-Z0-9_-]{20,}|"
                     r'("(?:api[_-]?key|token)"\s*:\s*")[^"]{20,}|'
                     r"\b(sk-[a-zA-Z0-9]{20,})\b|"
-                    r"\b(pk_[a-zA-Z0-9]{20,})\b",
+                    r"\b(pk_[a-zA-Z0-9_]{20,})\b",
                     re.IGNORECASE,
                 ),
                 "API_KEY_REDACTED",
@@ -349,6 +349,11 @@ def process_single_file(args: tuple[str, bytes]) -> AnonymizationResult:
         return AnonymizationResult(filename, data, {}, error=str(e))
 
 
+def process_file_chunk(chunk: list[tuple[str, bytes]]) -> list[AnonymizationResult]:
+    """Process a chunk of files in a single worker - reduces pickling overhead."""
+    return [process_single_file(item) for item in chunk]
+
+
 def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
     """Main processing function with batched processing for memory efficiency."""
     import shutil
@@ -416,45 +421,55 @@ def process_zip(zip_path: str, max_workers: Optional[int] = None) -> bool:
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 out_path.write_bytes(data)
 
-            # Process text files in batches
+            # Sort text files by size descending - process largest first for better load balancing
+            text_entries.sort(key=lambda e: e.file_size, reverse=True)
+
+            # Read all text file data
+            print("Reading text files...")
+            sys.stdout.flush()
+            file_data = []
+            for entry in text_entries:
+                data = src_zip.read(entry.filename)
+                file_data.append((entry.filename, data))
+
+            # Split into chunks for each worker (reduces pickle overhead)
             print("Anonymizing text files...")
             sys.stdout.flush()
-            processed = 0
 
-            for batch_start in range(0, len(text_entries), BATCH_SIZE):
-                batch_entries = text_entries[batch_start : batch_start + BATCH_SIZE]
+            # Distribute files round-robin across workers to balance load
+            # (since sorted by size, this spreads large files across workers)
+            chunks = [[] for _ in range(max_workers)]
+            for i, item in enumerate(file_data):
+                chunks[i % max_workers].append(item)
+            chunks = [c for c in chunks if c]  # Remove empty chunks
 
-                # Read batch data
-                batch_data = []
-                for entry in batch_entries:
-                    data = src_zip.read(entry.filename)
-                    batch_data.append((entry.filename, data))
+            results = {}
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                # Submit chunks to workers
+                futures = {executor.submit(process_file_chunk, chunk): i for i, chunk in enumerate(chunks)}
 
-                # Process batch in parallel
-                results = {}
-                with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                    futures = {
-                        executor.submit(process_single_file, f): f[0]
-                        for f in batch_data
-                    }
-                    for future in as_completed(futures):
-                        result = future.result()
+                processed = 0
+                for future in as_completed(futures):
+                    chunk_results = future.result()
+                    for result in chunk_results:
                         results[result.filename] = result
                         for cat, count in result.replacements.items():
                             total_stats[cat] += count
                         if result.error:
                             errors.append(f"{result.filename}: {result.error}")
+                        processed += 1
 
-                # Write batch results to output directory
-                for entry in batch_entries:
-                    result = results[entry.filename]
-                    out_path = output_dir / entry.filename
-                    out_path.parent.mkdir(parents=True, exist_ok=True)
-                    out_path.write_bytes(result.content)
+                    print(f"  Processed {processed}/{len(text_entries)} text files...")
+                    sys.stdout.flush()
 
-                processed += len(batch_entries)
-                print(f"  Processed {processed}/{len(text_entries)} text files...")
-                sys.stdout.flush()
+            # Write all results to output directory
+            print("Writing output files...")
+            sys.stdout.flush()
+            for entry in text_entries:
+                result = results[entry.filename]
+                out_path = output_dir / entry.filename
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_bytes(result.content)
 
         # Print results
         print("\n" + "=" * 60)
@@ -523,4 +538,5 @@ def main():
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()  # Required for Windows
     main()
