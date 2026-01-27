@@ -46,6 +46,7 @@ class AnonymizerGUI:
         # Track processing state
         self.processing = False
         self.output_dir = None
+        self.cancel_requested = False
 
         self._create_widgets()
         self._setup_output_redirect()
@@ -130,6 +131,14 @@ class AnonymizerGUI:
         )
         self.process_button.pack(side="left")
 
+        self.cancel_button = ttk.Button(
+            button_frame,
+            text="Cancel",
+            command=self._cancel_processing,
+            state="disabled"
+        )
+        self.cancel_button.pack(side="left", padx=(10, 0))
+
         self.open_folder_button = ttk.Button(
             button_frame,
             text="Open Output Folder",
@@ -196,6 +205,17 @@ class AnonymizerGUI:
             self.output_text.delete(1.0, tk.END)
             self.output_text.configure(state="disabled")
 
+    def _cancel_processing(self):
+        """Request cancellation of the current processing."""
+        if self.processing and not self.cancel_requested:
+            self.cancel_requested = True
+            self.cancel_button.configure(state="disabled")
+            self.status_var.set("Cancelling... please wait")
+
+    def _check_cancel(self) -> bool:
+        """Check if cancellation has been requested. Called by anonymizer."""
+        return self.cancel_requested
+
     def _start_processing(self):
         """Start the anonymization process in a background thread."""
         if self.processing:
@@ -206,8 +226,10 @@ class AnonymizerGUI:
             return
 
         self.processing = True
+        self.cancel_requested = False
         self.process_button.configure(state="disabled")
         self.browse_button.configure(state="disabled")
+        self.cancel_button.configure(state="normal")
         self.open_folder_button.configure(state="disabled")
         self.status_var.set("Processing...")
 
@@ -233,26 +255,32 @@ class AnonymizerGUI:
         sys.stderr = self.redirector
 
         try:
-            success = process_zip(zip_path)
+            success = process_zip(zip_path, cancel_check=self._check_cancel)
 
             # Schedule UI update on main thread
-            self.root.after(0, lambda: self._processing_complete(success))
+            was_cancelled = self.cancel_requested
+            self.root.after(0, lambda: self._processing_complete(success, was_cancelled))
 
         except Exception as e:
             print(f"\nError: {e}")
-            self.root.after(0, lambda: self._processing_complete(False))
+            self.root.after(0, lambda: self._processing_complete(False, False))
 
         finally:
             sys.stdout = old_stdout
             sys.stderr = old_stderr
 
-    def _processing_complete(self, success):
+    def _processing_complete(self, success, was_cancelled=False):
         """Called when processing is complete."""
         self.processing = False
+        self.cancel_requested = False
         self.process_button.configure(state="normal")
         self.browse_button.configure(state="normal")
+        self.cancel_button.configure(state="disabled")
 
-        if success and self.output_dir and self.output_dir.exists():
+        if was_cancelled:
+            self.status_var.set("Cancelled. No output created.")
+            self.output_dir = None
+        elif success and self.output_dir and self.output_dir.exists():
             self.status_var.set("Complete! Output ready.")
             self.open_folder_button.configure(state="normal")
         else:

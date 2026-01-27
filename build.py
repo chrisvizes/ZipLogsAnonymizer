@@ -39,6 +39,10 @@ def build():
             print(f"Cleaning {folder}/...")
             shutil.rmtree(folder)
 
+    # Determine platform-specific separator for --add-data
+    # Windows uses ';', Mac/Linux use ':'
+    separator = ";" if sys.platform == "win32" else ":"
+
     # PyInstaller command
     cmd = [
         sys.executable,
@@ -46,8 +50,8 @@ def build():
         "--onefile",              # Single executable
         "--windowed",             # No console window (GUI app)
         "--name", "ZipLogsAnonymizer",
-        "--add-data", "pattern_matcher.py;.",  # Include pattern_matcher module
-        "--add-data", "anonymizer.py;.",       # Include anonymizer module
+        "--add-data", f"pattern_matcher.py{separator}.",  # Include pattern_matcher module
+        "--add-data", f"anonymizer.py{separator}.",       # Include anonymizer module
         # Hidden imports that PyInstaller might miss
         "--hidden-import", "pattern_matcher",
         "--hidden-import", "anonymizer",
@@ -60,7 +64,12 @@ def build():
     result = subprocess.run(cmd)
 
     if result.returncode == 0:
-        exe_path = Path("dist/ZipLogsAnonymizer.exe")
+        # Executable name varies by platform
+        if sys.platform == "win32":
+            exe_path = Path("dist/ZipLogsAnonymizer.exe")
+        else:
+            exe_path = Path("dist/ZipLogsAnonymizer")
+
         if exe_path.exists():
             size_mb = exe_path.stat().st_size / 1024 / 1024
             print("\n" + "=" * 60)

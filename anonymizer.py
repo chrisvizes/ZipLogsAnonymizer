@@ -446,6 +446,15 @@ def process_zip(
         print("=" * 60)
         return True
 
+    except CancelledException:
+        print("\n\nProcessing cancelled by user.")
+        # Clean up partial output
+        if output_dir.exists():
+            print(f"Cleaning up partial output: {output_dir}")
+            shutil.rmtree(output_dir)
+        print("Cancelled successfully - no output created.")
+        return False
+
     except Exception as e:
         print(f"\nError during processing: {e}")
         import traceback
