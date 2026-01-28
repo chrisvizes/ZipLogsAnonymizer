@@ -4,11 +4,13 @@ ZipLogsAnonymizer - Anonymize sensitive data in log archives for safe sharing wi
 
 Usage: python anonymizer.py <path_to_zipfile>
 
-Optimized for large zip files (up to 2GB) with:
+Optised for large zip files (up to 2GB) with:
 - Streaming processing to minimize memory usage
 - Parallel anonymization with immediate disk writes
 - Outputs to an unzipped directory (preserving original structure)
 - 5x faster pattern matching via pre-filtering and line-by-line processing
+- ThreadPoolExecutor for large files (regex releases GIL)
+- Optimized I/O with larger buffers
 """
 
 import argparse
@@ -16,16 +18,24 @@ import sys
 import time
 import zipfile
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed, Future
+from concurrent.futures import (
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    as_completed,
+    Future,
+)
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Callable
 import multiprocessing
+import threading
 
 
 class CancelledException(Exception):
     """Raised when processing is cancelled by user."""
+
     pass
+
 
 # Import pattern matching
 from pattern_matcher import PatternMatcher, anonymize_content as pattern_anonymize
@@ -47,10 +57,106 @@ TEXT_EXTENSIONS = {
 }
 
 # Concurrency limits for memory management
-MAX_CONCURRENT_FUTURES = 8  # Max files in-flight at once (limits memory)
+MAX_CONCURRENT_FUTURES = 16  # Max small files in-flight at once
 LARGE_FILE_THRESHOLD = (
     5 * 1024 * 1024
-)  # 5MB - larger files processed serially in main process
+)  # 5MB - larger files use thread pool instead of serial
+
+# Memory safety settings
+MEMORY_SAFETY_FACTOR = 3.0  # Assume each file needs ~3x its size in memory (read + decode + output)
+MIN_FREE_MEMORY_MB = 500  # Always keep at least 500MB free
+
+
+def get_available_memory_mb() -> float:
+    """Get available system memory in MB. Cross-platform."""
+    try:
+        import psutil
+        return psutil.virtual_memory().available / (1024 * 1024)
+    except ImportError:
+        # psutil not installed - try platform-specific methods
+        pass
+
+    # Windows fallback
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            c_ulonglong = ctypes.c_ulonglong
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", c_ulonglong),
+                    ("ullAvailPhys", c_ulonglong),
+                    ("ullTotalPageFile", c_ulonglong),
+                    ("ullAvailPageFile", c_ulonglong),
+                    ("ullTotalVirtual", c_ulonglong),
+                    ("ullAvailVirtual", c_ulonglong),
+                    ("ullAvailExtendedVirtual", c_ulonglong),
+                ]
+
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(stat)
+            kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            return stat.ullAvailPhys / (1024 * 1024)
+        except Exception:
+            pass
+
+    # Linux/Mac fallback
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            for line in f:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) / 1024  # Convert KB to MB
+    except Exception:
+        pass
+
+    # Ultimate fallback: assume 4GB available
+    return 4096.0
+
+
+def calculate_max_concurrent_files(file_sizes_bytes: list[int]) -> int:
+    """
+    Calculate how many files can be safely processed concurrently based on memory.
+
+    Args:
+        file_sizes_bytes: List of file sizes in bytes
+
+    Returns:
+        Maximum number of files to process concurrently (at least 1)
+    """
+    if not file_sizes_bytes:
+        return 1
+
+    available_mb = get_available_memory_mb()
+    usable_mb = max(0, available_mb - MIN_FREE_MEMORY_MB)
+
+    if usable_mb <= 0:
+        print(f"  WARNING: Low memory ({available_mb:.0f} MB available). Processing files one at a time.")
+        return 1
+
+    # Sort files by size descending to consider worst case
+    sorted_sizes = sorted(file_sizes_bytes, reverse=True)
+
+    # Calculate how many of the largest files we can fit
+    total_required = 0
+    max_concurrent = 0
+    for size_bytes in sorted_sizes:
+        size_mb = size_bytes / (1024 * 1024)
+        memory_needed = size_mb * MEMORY_SAFETY_FACTOR
+        if total_required + memory_needed <= usable_mb:
+            total_required += memory_needed
+            max_concurrent += 1
+        else:
+            break
+
+    # Always allow at least 1
+    max_concurrent = max(1, max_concurrent)
+
+    print(f"  Memory available: {available_mb:.0f} MB | Usable: {usable_mb:.0f} MB | Max concurrent: {max_concurrent}")
+
+    return max_concurrent
 
 
 def format_time(seconds: float) -> str:
@@ -71,7 +177,9 @@ def format_time(seconds: float) -> str:
 class ProgressBar:
     """Simple text-based progress bar."""
 
-    def __init__(self, total: int, description: str = "", width: int = 40, show_eta: bool = True):
+    def __init__(
+        self, total: int, description: str = "", width: int = 40, show_eta: bool = True
+    ):
         self.total = total
         self.current = 0
         self.description = description
@@ -120,43 +228,104 @@ class ProgressBar:
 
 
 class LargeFileProgress:
-    """Progress display for processing large files one at a time."""
+    """Progress display for processing large files with throughput tracking and ETA."""
 
-    def __init__(self, total_files: int, total_size_mb: float):
+    def __init__(self, total_files: int, total_size_mb: float, max_concurrent: int = 1):
         self.total_files = total_files
         self.total_size_mb = total_size_mb
-        self.current_file = 0
+        self.completed = 0
+        self.completed_mb = 0.0
         self.start_time = time.time()
-        self.current_file_name = ""
-        self.current_file_size_mb = 0
+        self.max_concurrent = max_concurrent
+        self._lock = threading.Lock()
+        # Track per-file timing for throughput calculation
+        self._file_starts: dict[str, tuple[float, float]] = {}  # filename -> (start_time, size_mb)
+        self._throughputs: list[float] = []  # MB/s for each completed file
         self._render_header()
 
     def _render_header(self):
         """Print header for large file processing."""
-        print(f"\nProcessing {self.total_files} large file(s) ({self.total_size_mb:.1f} MB total)")
-        print("Large files are processed serially - this may take several minutes...")
-        print("-" * 60)
+        mode = f"(max {self.max_concurrent} concurrent)" if self.max_concurrent > 1 else "(sequential)"
+        print(f"\nProcessing {self.total_files} large file(s) ({self.total_size_mb:.1f} MB total) {mode}")
+        print("-" * 75)
+
+    def get_average_throughput(self) -> float:
+        """Get average throughput in MB/s across all completed files."""
+        with self._lock:
+            if not self._throughputs:
+                return 0.0
+            return sum(self._throughputs) / len(self._throughputs)
+
+    def get_eta_seconds(self) -> Optional[float]:
+        """Get estimated time remaining in seconds."""
+        avg_throughput = self.get_average_throughput()
+        if avg_throughput <= 0:
+            return None
+        remaining_mb = self.total_size_mb - self.completed_mb
+        return remaining_mb / avg_throughput
 
     def start_file(self, filename: str, size_bytes: int):
-        """Mark start of processing a new file."""
-        self.current_file += 1
-        self.current_file_name = Path(filename).name
-        self.current_file_size_mb = size_bytes / 1024 / 1024
-        # Truncate long filenames
-        display_name = self.current_file_name[:40] + "..." if len(self.current_file_name) > 43 else self.current_file_name
-        sys.stdout.write(f"\r[{self.current_file}/{self.total_files}] {display_name} ({self.current_file_size_mb:.1f} MB)...")
-        sys.stdout.flush()
+        """Mark start of processing a new file (thread-safe)."""
+        display_name = Path(filename).name
+        if len(display_name) > 40:
+            display_name = display_name[:37] + "..."
+        size_mb = size_bytes / 1024 / 1024
+        with self._lock:
+            self._file_starts[filename] = (time.time(), size_mb)
+            sys.stdout.write(f"  START: {display_name} ({size_mb:.1f} MB)\n")
+            sys.stdout.flush()
 
-    def finish_file(self, replacements: int):
-        """Mark completion of current file."""
-        sys.stdout.write(f" done ({replacements} replacements)\n")
-        sys.stdout.flush()
+    def finish_file(self, filename: str, replacements: int):
+        """Mark completion of current file with throughput stats (thread-safe)."""
+        display_name = Path(filename).name
+        if len(display_name) > 28:
+            display_name = display_name[:25] + "..."
 
-    def finish(self):
-        """Complete large file processing."""
+        with self._lock:
+            self.completed += 1
+
+            # Calculate throughput for this file
+            file_throughput = 0.0
+            file_size_mb = 0.0
+            if filename in self._file_starts:
+                start_time, file_size_mb = self._file_starts[filename]
+                elapsed = time.time() - start_time
+                if elapsed > 0:
+                    file_throughput = file_size_mb / elapsed
+                    self._throughputs.append(file_throughput)
+                self.completed_mb += file_size_mb
+                del self._file_starts[filename]
+
+            # Calculate average and ETA
+            avg_throughput = sum(self._throughputs) / len(self._throughputs) if self._throughputs else 0
+            remaining_mb = self.total_size_mb - self.completed_mb
+            eta_str = ""
+            if avg_throughput > 0 and remaining_mb > 0:
+                eta_seconds = remaining_mb / avg_throughput
+                eta_str = f" | ETA: {format_time(eta_seconds)}"
+
+            sys.stdout.write(
+                f"  DONE [{self.completed}/{self.total_files}]: {display_name} "
+                f"@ {file_throughput:.2f} MB/s ({replacements} repl) | "
+                f"Avg: {avg_throughput:.2f} MB/s{eta_str}\n"
+            )
+            sys.stdout.flush()
+
+    def finish(self) -> dict:
+        """Complete large file processing and return stats."""
         elapsed = time.time() - self.start_time
-        print("-" * 60)
-        print(f"Large files completed in {format_time(elapsed)}\n")
+        avg_throughput = self.get_average_throughput()
+        print("-" * 75)
+        print(f"Large files completed in {format_time(elapsed)}")
+        if avg_throughput > 0:
+            print(f"Average throughput: {avg_throughput:.2f} MB/s | Total: {self.completed_mb:.1f} MB")
+        print()
+        return {
+            "elapsed_seconds": elapsed,
+            "total_mb": self.completed_mb,
+            "avg_throughput_mb_s": avg_throughput,
+            "throughputs": list(self._throughputs),
+        }
 
 
 @dataclass
@@ -225,10 +394,121 @@ def process_single_file(args: tuple[str, bytes]) -> AnonymizationResult:
         return AnonymizationResult(filename, data, {}, error=str(e))
 
 
+def process_large_file_streaming(
+    data: bytes,
+    output_path: Path,
+) -> tuple[dict[str, int], Optional[str]]:
+    """
+    Process a large file using streaming to reduce memory pressure.
+    Writes output directly to disk in chunks.
+
+    Returns (counts_dict, error_string_or_none)
+    """
+    from pattern_matcher import FastAnonymizer
+
+    if is_likely_binary(data):
+        output_path.write_bytes(data)
+        return {}, None
+
+    # Try to decode
+    content = None
+    for encoding in ["utf-8", "utf-16", "latin-1", "cp1252"]:
+        try:
+            content = data.decode(encoding)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+
+    if content is None:
+        output_path.write_bytes(data)
+        return {}, None
+
+    try:
+        matcher = get_matcher()
+        # Create a fresh anonymizer for this file
+        anonymizer = FastAnonymizer(matcher)
+
+        # Process in chunks and write incrementally
+        CHUNK_LINES = 10000  # Process 10k lines at a time
+        lines = content.split("\n")
+        total_lines = len(lines)
+
+        # Pre-fetch for hot loop
+        multiline_patterns = matcher._multiline_patterns
+        all_keywords = matcher._all_keywords_lower
+        keyword_to_patterns = matcher._keyword_to_patterns
+
+        # First pass: handle multiline patterns on full content
+        for config in multiline_patterns:
+            content_lower = content.lower()
+            if any(kw in content_lower for kw in config.required_keywords):
+                content = anonymizer.apply_pattern(config, content)
+
+        # Re-split after multiline processing
+        lines = content.split("\n")
+
+        # Process and write in chunks
+        with open(
+            output_path, "w", encoding="utf-8", buffering=1024 * 1024
+        ) as f:  # 1MB buffer
+            chunk_start = 0
+            while chunk_start < total_lines:
+                chunk_end = min(chunk_start + CHUNK_LINES, total_lines)
+                chunk_lines = lines[chunk_start:chunk_end]
+
+                result_lines = []
+                for line in chunk_lines:
+                    if not line:
+                        result_lines.append(line)
+                        continue
+
+                    line_lower = line.lower()
+                    present_keywords = [kw for kw in all_keywords if kw in line_lower]
+
+                    if not present_keywords:
+                        result_lines.append(line)
+                        continue
+
+                    # Get applicable patterns
+                    seen_patterns = set()
+                    applicable = []
+                    for kw in present_keywords:
+                        for pattern in keyword_to_patterns.get(kw, []):
+                            if (
+                                not pattern.multiline
+                                and id(pattern) not in seen_patterns
+                            ):
+                                seen_patterns.add(id(pattern))
+                                applicable.append(pattern)
+
+                    if not applicable:
+                        result_lines.append(line)
+                        continue
+
+                    modified = line
+                    for config in applicable:
+                        modified = anonymizer.apply_pattern(config, modified)
+                    result_lines.append(modified)
+
+                # Write chunk
+                if chunk_start > 0:
+                    f.write("\n")
+                f.write("\n".join(result_lines))
+
+                chunk_start = chunk_end
+
+        return dict(anonymizer.counts), None
+
+    except Exception as e:
+        # On error, write original data
+        output_path.write_bytes(data)
+        return {}, str(e)
+
+
 def process_zip(
     zip_path: str,
     max_workers: Optional[int] = None,
-    cancel_check: Optional[Callable[[], bool]] = None
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> bool:
     """
     Main processing function with streaming writes for memory efficiency.
@@ -326,34 +606,80 @@ def process_zip(
                     e for e in text_entries if e.file_size < LARGE_FILE_THRESHOLD
                 ]
 
-                # Process large files serially in main process (avoids pickle overhead)
+                # Process large files with memory-aware concurrency
+                # (Threading works well here because regex releases the GIL)
                 if large_files:
                     check_cancelled()
                     large_total_mb = sum(e.file_size for e in large_files) / 1024 / 1024
-                    large_progress = LargeFileProgress(len(large_files), large_total_mb)
 
-                    for entry in large_files:
-                        check_cancelled()
+                    # Calculate safe concurrency based on available memory
+                    file_sizes = [e.file_size for e in large_files]
+                    max_concurrent = calculate_max_concurrent_files(file_sizes)
+
+                    large_progress = LargeFileProgress(
+                        len(large_files), large_total_mb, max_concurrent=max_concurrent
+                    )
+
+                    # Thread-safe stats collection
+                    stats_lock = threading.Lock()
+
+                    # Threshold for using streaming (20MB+)
+                    STREAMING_THRESHOLD = 20 * 1024 * 1024
+
+                    def process_large_file(entry):
+                        """Process a single large file (runs in thread)."""
                         large_progress.start_file(entry.filename, entry.file_size)
                         data = src_zip.read(entry.filename)
-                        result = process_single_file((entry.filename, data))
 
-                        # Write immediately
-                        out_path = output_dir / result.filename
+                        out_path = output_dir / entry.filename
                         out_path.parent.mkdir(parents=True, exist_ok=True)
-                        out_path.write_bytes(result.content)
 
-                        # Track stats
-                        file_replacements = sum(result.replacements.values())
-                        for cat, count in result.replacements.items():
-                            total_stats[cat] += count
-                        if result.error:
-                            errors.append(f"{result.filename}: {result.error}")
+                        # Use streaming for very large files to reduce memory pressure
+                        if entry.file_size >= STREAMING_THRESHOLD:
+                            counts, error = process_large_file_streaming(data, out_path)
+                            file_replacements = sum(counts.values())
+                            with stats_lock:
+                                for cat, count in counts.items():
+                                    total_stats[cat] += count
+                                if error:
+                                    errors.append(f"{entry.filename}: {error}")
+                        else:
+                            result = process_single_file((entry.filename, data))
+                            out_path.write_bytes(result.content)
+                            file_replacements = sum(result.replacements.values())
+                            with stats_lock:
+                                for cat, count in result.replacements.items():
+                                    total_stats[cat] += count
+                                if result.error:
+                                    errors.append(f"{result.filename}: {result.error}")
+                            del result
 
-                        large_progress.finish_file(file_replacements)
+                        large_progress.finish_file(entry.filename, file_replacements)
 
                         # Free memory
-                        del data, result
+                        del data
+                        return entry.filename
+
+                    if max_concurrent > 1 and len(large_files) >= 2:
+                        # Use thread pool with memory-safe concurrency
+                        num_threads = min(max_concurrent, len(large_files))
+                        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                            futures = {
+                                executor.submit(process_large_file, entry): entry
+                                for entry in large_files
+                            }
+                            for future in as_completed(futures):
+                                check_cancelled()
+                                try:
+                                    future.result()
+                                except Exception as e:
+                                    entry = futures[future]
+                                    errors.append(f"{entry.filename}: {e}")
+                    else:
+                        # Process sequentially (memory constrained or single file)
+                        for entry in large_files:
+                            check_cancelled()
+                            process_large_file(entry)
 
                     large_progress.finish()
 
@@ -361,7 +687,9 @@ def process_zip(
                 if small_files:
                     check_cancelled()
                     # Don't show ETA for small files - it's misleading early on
-                    progress = ProgressBar(len(small_files), "Small files  ", show_eta=False)
+                    progress = ProgressBar(
+                        len(small_files), "Small files  ", show_eta=False
+                    )
 
                     with ProcessPoolExecutor(max_workers=max_workers) as executor:
                         pending_futures: dict[Future, any] = {}
@@ -393,7 +721,9 @@ def process_zip(
                                     break
 
                                 # Wait for at least one to complete (with timeout for responsiveness)
-                                for completed in as_completed(pending_futures, timeout=0.5):
+                                for completed in as_completed(
+                                    pending_futures, timeout=0.5
+                                ):
                                     result = completed.result()
 
                                     # Write result to disk immediately
@@ -405,7 +735,9 @@ def process_zip(
                                     for cat, count in result.replacements.items():
                                         total_stats[cat] += count
                                     if result.error:
-                                        errors.append(f"{result.filename}: {result.error}")
+                                        errors.append(
+                                            f"{result.filename}: {result.error}"
+                                        )
 
                                     del pending_futures[completed]
                                     progress.update()

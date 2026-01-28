@@ -77,7 +77,7 @@ if not _is_worker_process():
             self.root.columnconfigure(0, weight=1)
             self.root.rowconfigure(0, weight=1)
             main_frame.columnconfigure(0, weight=1)
-            main_frame.rowconfigure(2, weight=1)
+            main_frame.rowconfigure(3, weight=1)  # Output area gets the space
 
             # Header
             header_frame = ttk.Frame(main_frame)
@@ -119,9 +119,47 @@ if not _is_worker_process():
             )
             hint_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(5, 0))
 
+            # Stats display frame (throughput and ETA)
+            stats_frame = ttk.LabelFrame(main_frame, text="Performance", padding="10")
+            stats_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+            stats_frame.columnconfigure(1, weight=1)
+
+            # Throughput display
+            ttk.Label(stats_frame, text="Throughput:", font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w", padx=(0, 10))
+            self.throughput_var = tk.StringVar(value="--")
+            self.throughput_label = ttk.Label(
+                stats_frame,
+                textvariable=self.throughput_var,
+                font=("Segoe UI", 14, "bold"),
+                foreground="#0066cc"
+            )
+            self.throughput_label.grid(row=0, column=1, sticky="w")
+
+            # ETA display
+            ttk.Label(stats_frame, text="ETA:", font=("Segoe UI", 9)).grid(row=0, column=2, sticky="w", padx=(30, 10))
+            self.eta_var = tk.StringVar(value="--")
+            self.eta_label = ttk.Label(
+                stats_frame,
+                textvariable=self.eta_var,
+                font=("Segoe UI", 14, "bold"),
+                foreground="#009933"
+            )
+            self.eta_label.grid(row=0, column=3, sticky="w")
+
+            # Progress percentage
+            ttk.Label(stats_frame, text="Progress:", font=("Segoe UI", 9)).grid(row=0, column=4, sticky="w", padx=(30, 10))
+            self.progress_var = tk.StringVar(value="--")
+            self.progress_label = ttk.Label(
+                stats_frame,
+                textvariable=self.progress_var,
+                font=("Segoe UI", 14, "bold"),
+                foreground="#cc6600"
+            )
+            self.progress_label.grid(row=0, column=5, sticky="w")
+
             # Output area
-            output_frame = ttk.LabelFrame(main_frame, text="Progress", padding="10")
-            output_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
+            output_frame = ttk.LabelFrame(main_frame, text="Log Output", padding="10")
+            output_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 10))
             output_frame.columnconfigure(0, weight=1)
             output_frame.rowconfigure(0, weight=1)
 
@@ -129,14 +167,14 @@ if not _is_worker_process():
                 output_frame,
                 wrap=tk.WORD,
                 font=("Consolas", 9),
-                height=15,
+                height=12,
                 state="disabled"
             )
             self.output_text.grid(row=0, column=0, sticky="nsew")
 
             # Button frame
             button_frame = ttk.Frame(main_frame)
-            button_frame.grid(row=3, column=0, sticky="ew")
+            button_frame.grid(row=4, column=0, sticky="ew")
 
             self.process_button = ttk.Button(
                 button_frame,
@@ -170,7 +208,7 @@ if not _is_worker_process():
                 font=("Segoe UI", 9),
                 foreground="gray"
             )
-            status_bar.grid(row=4, column=0, sticky="w", pady=(5, 0))
+            status_bar.grid(row=5, column=0, sticky="w", pady=(5, 0))
 
         def _setup_output_redirect(self):
             """Redirect stdout to the output text widget."""
@@ -178,6 +216,7 @@ if not _is_worker_process():
 
         def _process_queue(self):
             """Process messages from the queue and update the text widget."""
+            import re
             try:
                 while True:
                     message = self.message_queue.get_nowait()
@@ -192,6 +231,35 @@ if not _is_worker_process():
                     self.output_text.insert(tk.END, message)
                     self.output_text.see(tk.END)
                     self.output_text.configure(state="disabled")
+
+                    # Parse throughput and ETA from large file progress output
+                    # Format: "Avg: X.XX MB/s | ETA: Xm Xs"
+                    avg_match = re.search(r'Avg:\s*([\d.]+)\s*MB/s', message)
+                    if avg_match:
+                        self.throughput_var.set(f"{float(avg_match.group(1)):.2f} MB/s")
+
+                    eta_match = re.search(r'ETA:\s*(\d+[hms]\s*(?:\d+[ms]\s*)?(?:\d+s)?)', message)
+                    if eta_match:
+                        self.eta_var.set(eta_match.group(1).strip())
+
+                    # Parse progress from small files progress bar
+                    # Format: "[====----] 50% (100/200)"
+                    progress_match = re.search(r'(\d+)%\s*\((\d+)/(\d+)\)', message)
+                    if progress_match:
+                        pct = progress_match.group(1)
+                        current = progress_match.group(2)
+                        total = progress_match.group(3)
+                        self.progress_var.set(f"{pct}% ({current}/{total})")
+
+                    # Parse large file progress
+                    # Format: "[X/Y]" for completed files
+                    large_progress_match = re.search(r'\[(\d+)/(\d+)\].*DONE', message)
+                    if large_progress_match:
+                        current = int(large_progress_match.group(1))
+                        total = int(large_progress_match.group(2))
+                        pct = int(current * 100 / total) if total > 0 else 0
+                        self.progress_var.set(f"{pct}% ({current}/{total} files)")
+
             except queue.Empty:
                 pass
 
@@ -247,6 +315,11 @@ if not _is_worker_process():
             self.cancel_button.configure(state="normal")
             self.open_folder_button.configure(state="disabled")
             self.status_var.set("Processing...")
+
+            # Reset stats display
+            self.throughput_var.set("--")
+            self.eta_var.set("--")
+            self.progress_var.set("--")
 
             # Calculate expected output directory
             zip_file = Path(zip_path)
