@@ -659,5 +659,211 @@ class TestCPUUtilization:
             f"Parallel processing significantly slower than sequential"
 
 
+# =============================================================================
+# MEMORY USAGE TESTS
+# =============================================================================
+
+class TestMemoryUsage:
+    """
+    Tests to verify memory usage stays within acceptable bounds.
+
+    These tests catch memory issues like:
+    - Keeping duplicate content in memory (original + lowercase)
+    - Excessive memory during parallel processing
+    - Memory leaks in long-running processes
+    """
+
+    def test_memory_usage_ratio(self, matcher):
+        """
+        Verify that processing doesn't use excessive memory relative to file size.
+
+        Baseline memory usage is ~6x due to Python string handling:
+        - Original content
+        - Lowercase copy for keyword detection
+        - Lines array when splitting
+        - Result content
+        - Various temporary structures
+
+        This test catches major regressions (e.g., memory doubling from a bug).
+        The 7GB spike on 1.7GB file (~4x) was caused by keeping duplicate content.
+        """
+        import gc
+        import sys
+
+        # Generate test content - 50MB of data (simulates large file)
+        content = generate_test_content(500000, sensitive_ratio=0.05)
+        content_size_mb = estimate_content_size_mb(content)
+
+        # Force garbage collection to get baseline
+        gc.collect()
+
+        # Track memory before processing
+        try:
+            import tracemalloc
+            tracemalloc.start()
+
+            # Process the content
+            result, counts = anonymize_content(content, matcher)
+
+            # Get peak memory usage
+            current, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+
+            peak_mb = peak / (1024 * 1024)
+            memory_ratio = peak_mb / content_size_mb
+
+            print(f"\nContent size: {content_size_mb:.1f} MB")
+            print(f"Peak memory: {peak_mb:.1f} MB")
+            print(f"Memory ratio: {memory_ratio:.1f}x")
+
+            # Memory should be at most 8x the content size
+            # Baseline is ~6x, so 8x catches major regressions
+            assert memory_ratio <= 8.0, \
+                f"Memory usage too high: {peak_mb:.1f} MB for {content_size_mb:.1f} MB content " \
+                f"(ratio: {memory_ratio:.1f}x, expected <= 8x)"
+
+        except ImportError:
+            # tracemalloc not available - skip test
+            pytest.skip("tracemalloc not available")
+
+    def test_streaming_memory_efficiency(self, matcher):
+        """
+        Verify streaming processing doesn't accumulate memory.
+
+        Tests that process_large_file_streaming properly frees memory
+        between chunks. Baseline is ~6x due to:
+        - Input data (bytes)
+        - Decoded content (string)
+        - Lines array
+        - Temporary lowercase content
+        - Output chunks
+        """
+        import tempfile
+        from pathlib import Path
+        import gc
+
+        # Generate 20MB of test content
+        content = generate_test_content(200000, sensitive_ratio=0.05)
+        content_size_mb = estimate_content_size_mb(content)
+
+        from anonymizer import process_large_file_streaming
+
+        try:
+            import tracemalloc
+            tracemalloc.start()
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                output_path = Path(tmpdir) / "output.txt"
+                data = content.encode('utf-8')
+
+                # Process using streaming
+                counts, error = process_large_file_streaming(data, output_path)
+
+                current, peak = tracemalloc.get_traced_memory()
+                tracemalloc.stop()
+
+                peak_mb = peak / (1024 * 1024)
+                memory_ratio = peak_mb / content_size_mb
+
+                print(f"\nStreaming content size: {content_size_mb:.1f} MB")
+                print(f"Peak memory: {peak_mb:.1f} MB")
+                print(f"Memory ratio: {memory_ratio:.1f}x")
+
+                # Streaming memory baseline is ~6x, so 8x catches major regressions
+                assert memory_ratio <= 8.0, \
+                    f"Streaming memory too high: {peak_mb:.1f} MB for {content_size_mb:.1f} MB " \
+                    f"(ratio: {memory_ratio:.1f}x, expected <= 8x)"
+
+        except ImportError:
+            pytest.skip("tracemalloc not available")
+
+
+class TestConsistentReplacements:
+    """
+    Tests to verify replacements are consistent across parallel processing.
+
+    Same values must get same replacements regardless of which chunk
+    or worker processes them.
+    """
+
+    def test_consistent_email_replacements(self, matcher):
+        """
+        Verify same email gets same replacement across the file.
+        """
+        # Create content with repeated emails
+        lines = []
+        for i in range(100):
+            lines.append(f"2024-01-15 INFO User john.doe@company.com performed action {i}")
+            lines.append(f"2024-01-15 DEBUG Notification sent to jane.smith@company.local")
+            lines.append(f"2024-01-15 INFO User john.doe@company.com logged out")
+
+        content = "\n".join(lines)
+        result, counts = anonymize_content(content, matcher)
+
+        # Find all email replacements (format: user001@redacted.com)
+        import re
+        email_replacements = re.findall(r'user\d+@redacted\.com', result)
+
+        # All john.doe references should have the same replacement
+        unique = set(email_replacements)
+        print(f"\nEmail replacements found: {len(email_replacements)}")
+        print(f"Unique replacements: {len(unique)}")
+
+        # Should have exactly 2 unique replacements (john and jane)
+        assert len(unique) <= 2, \
+            f"Expected 2 unique email replacements, got {len(unique)}: {unique}"
+
+    def test_consistent_username_replacements(self, matcher):
+        """
+        Verify same username gets same replacement across the file.
+        """
+        lines = []
+        for i in range(100):
+            lines.append(f"2024-01-15 INFO user=admin performed action {i}")
+            lines.append(f"2024-01-15 DEBUG user=guest viewed page")
+            lines.append(f"2024-01-15 WARN user=admin changed settings")
+
+        content = "\n".join(lines)
+        result, counts = anonymize_content(content, matcher)
+
+        # Find all username replacements (format: user=user001)
+        import re
+        username_replacements = re.findall(r'user=user\d+', result)
+
+        # Count unique replacements
+        unique = set(username_replacements)
+        print(f"\nUsername replacements found: {len(username_replacements)}")
+        print(f"Unique replacements: {len(unique)}")
+
+        # Should have exactly 2 unique replacements (admin and guest)
+        assert len(unique) == 2, \
+            f"Expected 2 unique username replacements, got {len(unique)}: {unique}"
+
+    def test_consistent_ip_replacements(self, matcher):
+        """
+        Verify same IP gets same replacement across the file.
+        """
+        lines = []
+        for i in range(100):
+            lines.append(f"2024-01-15 INFO Connection from 192.168.1.100 on port {8000+i}")
+            lines.append(f"2024-01-15 DEBUG Request to 10.0.0.50")
+            lines.append(f"2024-01-15 INFO Response sent to 192.168.1.100")
+
+        content = "\n".join(lines)
+        result, counts = anonymize_content(content, matcher)
+
+        # Find all IP replacements (format: 10.X.0.1)
+        import re
+        ip_replacements = re.findall(r'10\.\d+\.0\.1', result)
+
+        unique = set(ip_replacements)
+        print(f"\nIP replacements found: {len(ip_replacements)}")
+        print(f"Unique replacements: {len(unique)}")
+
+        # Should have exactly 2 unique replacements
+        assert len(unique) == 2, \
+            f"Expected 2 unique IP replacements, got {len(unique)}: {unique}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

@@ -39,7 +39,14 @@ python3 gui.py
 
 ### Output
 
-The tool creates a folder named `<your-zip>_anonymized` containing all files with sensitive data redacted. The original zip file is not modified.
+The tool creates:
+
+- **`<your-zip>_anonymized.zip`** - A zip file ready for use with tools like LogShark
+- **`<your-zip>_anonymized/`** - An uncompressed folder (useful for browsing/searching)
+
+Both outputs are created by default. The original zip file is not modified.
+
+Use `--no-zip` to skip creating the zip file, or `--no-uncompressed` to skip keeping the uncompressed folder.
 
 ---
 
@@ -59,37 +66,37 @@ The following sensitive data patterns are detected and replaced:
 
 ### Personal Information
 
-| Data Type       | Detection Method                                  | Example                | Replacement              |
-| --------------- | ------------------------------------------------- | ---------------------- | ------------------------ |
-| Email Addresses | Standard email regex                              | `john.doe@company.com` | `EMAIL_001@redacted.com` |
-| Usernames       | Context keywords (`user=`, `username:`, `login=`) | `user=jsmith`          | `user=USERNAME_001`      |
-| SSNs            | Format `###-##-####`                              | `123-45-6789`          | `SSN_REDACTED`           |
+| Data Type       | Detection Method                                  | Example                | Replacement               |
+| --------------- | ------------------------------------------------- | ---------------------- | ------------------------- |
+| Email Addresses | Standard email regex                              | `john.doe@company.com` | `user001@redacted.com`    |
+| Usernames       | Context keywords (`user=`, `username:`, `login=`) | `user=jsmith`          | `user=user001`            |
+| SSNs            | Format `###-##-####`                              | `123-45-6789`          | `SSN_REDACTED`            |
 
 ### Network & Infrastructure
 
 | Data Type            | Detection Method                                                        | Example                     | Replacement                        |
 | -------------------- | ----------------------------------------------------------------------- | --------------------------- | ---------------------------------- |
-| Internal IPs         | Private IP ranges (10.x, 192.168.x, 172.16-31.x)                        | `192.168.1.100`             | `INTERNAL_IP_001`                  |
-| Internal Hostnames   | `.local`, `.internal`, `.corp`, `.lan`, `.intranet`, `.private` domains | `server.corp`               | `HOSTNAME_001.redacted`            |
+| Internal IPs         | Private IP ranges (10.x, 192.168.x, 172.16-31.x)                        | `192.168.1.100`             | `10.0.0.1`                         |
+| Internal Hostnames   | `.local`, `.internal`, `.corp`, `.lan`, `.intranet`, `.private` domains | `server.corp`               | `host001.redacted`                 |
 | UNC Paths            | `\\server\share` pattern                                                | `\\fileserver\data`         | `\\REDACTED_SERVER\REDACTED_SHARE` |
 | MAC Addresses        | Standard MAC format                                                     | `00:1A:2B:3C:4D:5E`         | `MAC_REDACTED`                     |
 | Database Connections | JDBC URLs and connection strings                                        | `jdbc:mysql://db:3306/prod` | `DB_REDACTED`                      |
 
 ### Tableau-Specific
 
-| Data Type        | Detection Method      | Example                   | Replacement                     |
-| ---------------- | --------------------- | ------------------------- | ------------------------------- |
-| Site Names       | `site=` context       | `site=CustomerPortal`     | `site=TABLEAU_ENTITY_001`       |
-| Workbook Names   | `workbook=` context   | `workbook=SalesReport`    | `workbook=TABLEAU_ENTITY_002`   |
-| Datasource Names | `datasource=` context | `datasource=ProductionDB` | `datasource=TABLEAU_ENTITY_003` |
-| Project Names    | `project=` context    | `project=Finance`         | `project=TABLEAU_ENTITY_004`    |
+| Data Type        | Detection Method      | Example                   | Replacement               |
+| ---------------- | --------------------- | ------------------------- | ------------------------- |
+| Site Names       | `site=` context       | `site=CustomerPortal`     | `site=entity001`          |
+| Workbook Names   | `workbook=` context   | `workbook=SalesReport`    | `workbook=entity002`      |
+| Datasource Names | `datasource=` context | `datasource=ProductionDB` | `datasource=entity003`    |
+| Project Names    | `project=` context    | `project=Finance`         | `project=entity004`       |
 
 ### Consistency Guarantee
 
 The same original value always maps to the same replacement throughout all files:
 
-- `john@company.com` → `EMAIL_001@redacted.com` (every occurrence)
-- `192.168.1.50` → `INTERNAL_IP_001` (every occurrence)
+- `john@company.com` → `user001@redacted.com` (every occurrence)
+- `192.168.1.50` → `10.1.0.1` (every occurrence)
 
 This preserves the ability to trace issues across log files while hiding the actual values.
 
@@ -118,11 +125,11 @@ The following are **intentionally not modified** and may still contain sensitive
 
 ### Processing Pipeline
 
-```
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐     ┌──────────────┐
-│  Input Zip  │ ──► │ Categorize   │ ──► │ Anonymize   │ ──► │ Output Dir   │
-│   File      │     │ Files        │     │ Text Files  │     │ (unzipped)   │
-└─────────────┘     └──────────────┘     └─────────────┘     └──────────────┘
+```text
+┌─────────────┐     ┌──────────────┐     ┌─────────────┐     ┌──────────────┐     ┌──────────────┐
+│  Input Zip  │ ──► │ Categorize   │ ──► │ Anonymize   │ ──► │ Output Dir   │ ──► │ Output Zip   │
+│   File      │     │ Files        │     │ Text Files  │     │ (unzipped)   │     │ (for tools)  │
+└─────────────┘     └──────────────┘     └─────────────┘     └──────────────┘     └──────────────┘
                            │                    │
                            ▼                    ▼
                     Binary files         Text files scanned
@@ -141,31 +148,33 @@ The following are **intentionally not modified** and may still contain sensitive
 
 ### Performance Optimizations
 
-The tool is designed to handle large log archives (500MB - 2GB zips containing thousands of files):
+The tool is designed to handle large log archives (1-2GB+ zips containing thousands of files). Real-world benchmark on a 1.8GB zip (14.3GB uncompressed): **~11 MB/s throughput, completed in under 30 minutes**.
 
-| Challenge              | Solution                                                                                                                                      |
-| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Memory usage**       | Memory-aware concurrency - automatically limits parallel processing based on available RAM to prevent out-of-memory errors                    |
-| **Large files (>5MB)** | Processed with ThreadPoolExecutor using memory-safe concurrency; very large files (>20MB) use streaming to reduce memory pressure             |
-| **Small files**        | Processed in parallel across multiple CPU cores (up to 16 concurrent)                                                                         |
-| **Regex performance**  | Pre-filtering with keyword checks - lines without relevant keywords (like `@`, `password`, `jdbc:`) skip regex entirely, reducing work by ~5x |
-| **Pattern matching**   | Line-by-line processing with early exit - each line only runs against patterns whose keywords appear in that line                             |
+| Challenge | Solution |
+| --- | --- |
+| **Memory usage** | Memory-aware concurrency - automatically limits parallel processing based on available RAM. Large files processed with streaming to avoid memory spikes. |
+| **Large files (>10MB)** | Parallel chunk processing using ProcessPoolExecutor to bypass Python's GIL. Files split into chunks and processed across multiple CPU cores. |
+| **Small files** | Processed in parallel across multiple CPU cores using ProcessPoolExecutor (up to 16 concurrent). |
+| **Regex performance** | Batch keyword pre-screening - scans entire content once to find which keywords are present, then only checks those keywords per-line. |
+| **Pattern matching** | Line-by-line processing with early exit - each line only runs against patterns whose keywords appear in that line. Typically reduces checks from ~25 to 1-3 patterns per line. |
 
 ### Architecture
 
-```
+```text
 ZipLogsAnonymizer/
-├── gui.py              # GUI application (tkinter) - user interface
-├── anonymizer.py       # Main processing logic - file handling, parallelization
-├── pattern_matcher.py  # Pattern definitions and matching logic
-├── test_anonymizer.py  # Test suite (105 tests)
-├── build.py            # Build script for creating executable
-└── requirements.txt    # Python dependencies
+├── gui.py               # GUI application (tkinter) - user interface
+├── anonymizer.py        # Main processing logic - file handling, parallelization
+├── pattern_matcher.py   # Pattern definitions and matching logic
+├── test_anonymizer.py   # Test suite - pattern matching and edge cases
+├── test_performance.py  # Performance tests - throughput, memory, consistency
+├── benchmark.py         # Benchmark script for real-world testing
+├── build.py             # Build script for creating executable
+└── requirements.txt     # Python dependencies
 ```
 
-- **`pattern_matcher.py`**: Defines all sensitive data patterns with their regex, replacement text, and required keywords for pre-filtering
-- **`anonymizer.py`**: Handles zip extraction, file categorization, parallel processing, progress display, and output writing
-- **`gui.py`**: Provides the graphical interface wrapping the core logic
+- **`pattern_matcher.py`**: Defines all sensitive data patterns with their regex, replacement text, and required keywords for pre-filtering. Uses natural-looking replacements (e.g., `user001` instead of `USERNAME_001`) for compatibility with log analysis tools like LogShark.
+- **`anonymizer.py`**: Handles zip extraction, file categorization, parallel processing (using ProcessPoolExecutor for CPU-bound work), progress display, and output writing. Creates both uncompressed directory and zip file output.
+- **`gui.py`**: Provides the graphical interface with real-time throughput, time remaining, and progress tracking.
 
 ---
 
@@ -218,8 +227,12 @@ For scripting or automation without the GUI:
 python anonymizer.py <path-to-zip-file>
 
 # Options:
-#   -w, --workers N    Number of parallel workers (default: CPU count, max 8)
+#   -w, --workers N      Number of parallel workers (default: CPU count, max 8)
+#   --no-zip             Don't create output zip file (only keep uncompressed directory)
+#   --no-uncompressed    Don't keep uncompressed directory (only create zip file)
 ```
+
+By default, both a zip file and uncompressed directory are created. The zip file is ready for use with tools like LogShark.
 
 ### Building the Executable
 

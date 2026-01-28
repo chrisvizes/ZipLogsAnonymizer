@@ -13,11 +13,13 @@ import multiprocessing
 # without re-running the main script.
 multiprocessing.freeze_support()
 
+
 # Check if this is a worker process in a frozen executable.
 # Workers should not import GUI modules or run GUI code.
 def _is_worker_process():
     """Check if current process is a multiprocessing worker."""
-    return multiprocessing.current_process().name != 'MainProcess'
+    return multiprocessing.current_process().name != "MainProcess"
+
 
 # Only import GUI modules in the main process
 if not _is_worker_process():
@@ -27,10 +29,10 @@ if not _is_worker_process():
     from pathlib import Path
     import queue
     import os
+    import webbrowser
 
     # Import the core anonymization logic
     from anonymizer import process_zip, TEXT_EXTENSIONS
-
 
     class RedirectText:
         """Redirect stdout/stderr to a tkinter text widget."""
@@ -44,7 +46,6 @@ if not _is_worker_process():
 
         def flush(self):
             pass
-
 
     class AnonymizerGUI:
         """Main GUI application for ZipLogsAnonymizer."""
@@ -77,36 +78,56 @@ if not _is_worker_process():
             self.root.columnconfigure(0, weight=1)
             self.root.rowconfigure(0, weight=1)
             main_frame.columnconfigure(0, weight=1)
-            main_frame.rowconfigure(3, weight=1)  # Output area gets the space
+            main_frame.rowconfigure(4, weight=1)  # Output area gets the space
 
             # Header
             header_frame = ttk.Frame(main_frame)
             header_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
 
             title_label = ttk.Label(
-                header_frame,
-                text="ZipLogsAnonymizer",
-                font=("Segoe UI", 16, "bold")
+                header_frame, text="ZipLogsAnonymizer", font=("Segoe UI", 16, "bold")
             )
             title_label.pack(anchor="w")
 
             desc_label = ttk.Label(
                 header_frame,
                 text="Anonymize sensitive data in log archives for safe sharing",
-                font=("Segoe UI", 9)
+                font=("Segoe UI", 9),
             )
             desc_label.pack(anchor="w")
 
+            # Link to documentation
+            link_label = ttk.Label(
+                header_frame,
+                text="Learn more about how this works",
+                font=("Segoe UI", 9, "underline"),
+                foreground="#0066cc",
+                cursor="hand2",
+            )
+            link_label.pack(anchor="w", pady=(2, 0))
+            link_label.bind(
+                "<Button-1>",
+                lambda e: webbrowser.open(
+                    "https://github.com/chrisvizes/ZipLogsAnonymizer"
+                ),
+            )
+
             # File selection frame
-            file_frame = ttk.LabelFrame(main_frame, text="Select Zip File", padding="10")
+            file_frame = ttk.LabelFrame(
+                main_frame, text="Select Zip File", padding="10"
+            )
             file_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
             file_frame.columnconfigure(0, weight=1)
 
             self.file_path_var = tk.StringVar()
-            self.file_entry = ttk.Entry(file_frame, textvariable=self.file_path_var, state="readonly")
+            self.file_entry = ttk.Entry(
+                file_frame, textvariable=self.file_path_var, state="readonly"
+            )
             self.file_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
 
-            self.browse_button = ttk.Button(file_frame, text="Browse...", command=self._browse_file)
+            self.browse_button = ttk.Button(
+                file_frame, text="Browse...", command=self._browse_file
+            )
             self.browse_button.grid(row=0, column=1)
 
             # Supported formats hint
@@ -115,51 +136,91 @@ if not _is_worker_process():
                 file_frame,
                 text=f"Text formats processed: {formats}",
                 font=("Segoe UI", 8),
-                foreground="gray"
+                foreground="gray",
             )
             hint_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(5, 0))
 
-            # Stats display frame (throughput and ETA)
+            # Output options frame
+            options_frame = ttk.LabelFrame(
+                main_frame, text="Output Options", padding="10"
+            )
+            options_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+
+            # Create zip file checkbox (default: checked)
+            self.create_zip_var = tk.BooleanVar(value=True)
+            self.create_zip_check = ttk.Checkbutton(
+                options_frame, text="Output as a zip file", variable=self.create_zip_var
+            )
+            self.create_zip_check.grid(row=0, column=0, sticky="w")
+
+            # Keep uncompressed folder checkbox (default: checked)
+            self.keep_uncompressed_var = tk.BooleanVar(value=True)
+            self.keep_uncompressed_check = ttk.Checkbutton(
+                options_frame,
+                text="Output uncompressed folder (for browsing/searching)",
+                variable=self.keep_uncompressed_var,
+            )
+            self.keep_uncompressed_check.grid(row=1, column=0, sticky="w")
+
+            # Stats display frame - all stats on one row
             stats_frame = ttk.LabelFrame(main_frame, text="Performance", padding="10")
-            stats_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
-            stats_frame.columnconfigure(1, weight=1)
+            stats_frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
 
-            # Throughput display
-            ttk.Label(stats_frame, text="Throughput:", font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w", padx=(0, 10))
-            self.throughput_var = tk.StringVar(value="--")
-            self.throughput_label = ttk.Label(
-                stats_frame,
-                textvariable=self.throughput_var,
-                font=("Segoe UI", 14, "bold"),
-                foreground="#0066cc"
+            # Progress display
+            ttk.Label(stats_frame, text="Progress:", font=("Segoe UI", 9)).grid(
+                row=0, column=0, sticky="w", padx=(0, 5)
             )
-            self.throughput_label.grid(row=0, column=1, sticky="w")
-
-            # ETA display
-            ttk.Label(stats_frame, text="ETA:", font=("Segoe UI", 9)).grid(row=0, column=2, sticky="w", padx=(30, 10))
-            self.eta_var = tk.StringVar(value="--")
-            self.eta_label = ttk.Label(
-                stats_frame,
-                textvariable=self.eta_var,
-                font=("Segoe UI", 14, "bold"),
-                foreground="#009933"
-            )
-            self.eta_label.grid(row=0, column=3, sticky="w")
-
-            # Progress percentage
-            ttk.Label(stats_frame, text="Progress:", font=("Segoe UI", 9)).grid(row=0, column=4, sticky="w", padx=(30, 10))
             self.progress_var = tk.StringVar(value="--")
             self.progress_label = ttk.Label(
                 stats_frame,
                 textvariable=self.progress_var,
                 font=("Segoe UI", 14, "bold"),
-                foreground="#cc6600"
+                foreground="#cc6600",
             )
-            self.progress_label.grid(row=0, column=5, sticky="w")
+            self.progress_label.grid(row=0, column=1, sticky="w")
+
+            # Total size display
+            ttk.Label(stats_frame, text="Total size:", font=("Segoe UI", 9)).grid(
+                row=0, column=2, sticky="w", padx=(20, 5)
+            )
+            self.total_size_var = tk.StringVar(value="--")
+            self.total_size_label = ttk.Label(
+                stats_frame,
+                textvariable=self.total_size_var,
+                font=("Segoe UI", 14, "bold"),
+                foreground="#666666",
+            )
+            self.total_size_label.grid(row=0, column=3, sticky="w")
+
+            # Throughput display
+            ttk.Label(stats_frame, text="Throughput:", font=("Segoe UI", 9)).grid(
+                row=0, column=4, sticky="w", padx=(20, 5)
+            )
+            self.throughput_var = tk.StringVar(value="--")
+            self.throughput_label = ttk.Label(
+                stats_frame,
+                textvariable=self.throughput_var,
+                font=("Segoe UI", 14, "bold"),
+                foreground="#0066cc",
+            )
+            self.throughput_label.grid(row=0, column=5, sticky="w")
+
+            # Time remaining display
+            ttk.Label(stats_frame, text="Time remaining:", font=("Segoe UI", 9)).grid(
+                row=0, column=6, sticky="w", padx=(20, 5)
+            )
+            self.eta_var = tk.StringVar(value="--")
+            self.eta_label = ttk.Label(
+                stats_frame,
+                textvariable=self.eta_var,
+                font=("Segoe UI", 14, "bold"),
+                foreground="#009933",
+            )
+            self.eta_label.grid(row=0, column=7, sticky="w")
 
             # Output area
             output_frame = ttk.LabelFrame(main_frame, text="Log Output", padding="10")
-            output_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 10))
+            output_frame.grid(row=4, column=0, sticky="nsew", pady=(0, 10))
             output_frame.columnconfigure(0, weight=1)
             output_frame.rowconfigure(0, weight=1)
 
@@ -168,19 +229,19 @@ if not _is_worker_process():
                 wrap=tk.WORD,
                 font=("Consolas", 9),
                 height=12,
-                state="disabled"
+                state="disabled",
             )
             self.output_text.grid(row=0, column=0, sticky="nsew")
 
             # Button frame
             button_frame = ttk.Frame(main_frame)
-            button_frame.grid(row=4, column=0, sticky="ew")
+            button_frame.grid(row=5, column=0, sticky="ew")
 
             self.process_button = ttk.Button(
                 button_frame,
                 text="Anonymize",
                 command=self._start_processing,
-                state="disabled"
+                state="disabled",
             )
             self.process_button.pack(side="left")
 
@@ -188,7 +249,7 @@ if not _is_worker_process():
                 button_frame,
                 text="Cancel",
                 command=self._cancel_processing,
-                state="disabled"
+                state="disabled",
             )
             self.cancel_button.pack(side="left", padx=(10, 0))
 
@@ -196,7 +257,7 @@ if not _is_worker_process():
                 button_frame,
                 text="Open Output Folder",
                 command=self._open_output_folder,
-                state="disabled"
+                state="disabled",
             )
             self.open_folder_button.pack(side="left", padx=(10, 0))
 
@@ -206,9 +267,9 @@ if not _is_worker_process():
                 main_frame,
                 textvariable=self.status_var,
                 font=("Segoe UI", 9),
-                foreground="gray"
+                foreground="gray",
             )
-            status_bar.grid(row=5, column=0, sticky="w", pady=(5, 0))
+            status_bar.grid(row=6, column=0, sticky="w", pady=(5, 0))
 
         def _setup_output_redirect(self):
             """Redirect stdout to the output text widget."""
@@ -217,13 +278,14 @@ if not _is_worker_process():
         def _process_queue(self):
             """Process messages from the queue and update the text widget."""
             import re
+
             try:
                 while True:
                     message = self.message_queue.get_nowait()
                     self.output_text.configure(state="normal")
 
                     # Handle carriage return for progress bar updates
-                    if message.startswith('\r'):
+                    if message.startswith("\r"):
                         # Delete the current line and insert new content
                         self.output_text.delete("end-1c linestart", "end-1c")
                         message = message[1:]  # Remove the \r
@@ -232,19 +294,39 @@ if not _is_worker_process():
                     self.output_text.see(tk.END)
                     self.output_text.configure(state="disabled")
 
+                    # Parse total uncompressed size from large file header
+                    # Format: "Processing X large file(s) (XXX.X MB total)"
+                    total_size_match = re.search(
+                        r"\((\d+(?:\.\d+)?)\s*MB total\)", message
+                    )
+                    if total_size_match:
+                        size_mb = float(total_size_match.group(1))
+                        if size_mb >= 1000:
+                            self.total_size_var.set(f"{size_mb/1024:.2f} GB")
+                        else:
+                            self.total_size_var.set(f"{size_mb:.1f} MB")
+
                     # Parse throughput and ETA from large file progress output
                     # Format: "Avg: X.XX MB/s | ETA: Xm Xs"
-                    avg_match = re.search(r'Avg:\s*([\d.]+)\s*MB/s', message)
+                    avg_match = re.search(r"Avg:\s*([\d.]+)\s*MB/s", message)
                     if avg_match:
                         self.throughput_var.set(f"{float(avg_match.group(1)):.2f} MB/s")
 
-                    eta_match = re.search(r'ETA:\s*(\d+[hms]\s*(?:\d+[ms]\s*)?(?:\d+s)?)', message)
+                    # Parse time remaining (formerly ETA)
+                    eta_match = re.search(
+                        r"ETA:\s*(\d+[hms]\s*(?:\d+[ms]\s*)?(?:\d+s)?)", message
+                    )
                     if eta_match:
                         self.eta_var.set(eta_match.group(1).strip())
 
+                    # Detect completion - clear time remaining
+                    if "ANONYMIZATION COMPLETE" in message:
+                        self.eta_var.set("Complete!")
+                        self.progress_var.set("100%")
+
                     # Parse progress from small files progress bar
                     # Format: "[====----] 50% (100/200)"
-                    progress_match = re.search(r'(\d+)%\s*\((\d+)/(\d+)\)', message)
+                    progress_match = re.search(r"(\d+)%\s*\((\d+)/(\d+)\)", message)
                     if progress_match:
                         pct = progress_match.group(1)
                         current = progress_match.group(2)
@@ -253,7 +335,7 @@ if not _is_worker_process():
 
                     # Parse large file progress
                     # Format: "[X/Y]" for completed files
-                    large_progress_match = re.search(r'\[(\d+)/(\d+)\].*DONE', message)
+                    large_progress_match = re.search(r"\[(\d+)/(\d+)\].*DONE", message)
                     if large_progress_match:
                         current = int(large_progress_match.group(1))
                         total = int(large_progress_match.group(2))
@@ -270,10 +352,7 @@ if not _is_worker_process():
             """Open file dialog to select a zip file."""
             filename = filedialog.askopenfilename(
                 title="Select Zip File",
-                filetypes=[
-                    ("Zip files", "*.zip"),
-                    ("All files", "*.*")
-                ]
+                filetypes=[("Zip files", "*.zip"), ("All files", "*.*")],
             )
 
             if filename:
@@ -314,9 +393,12 @@ if not _is_worker_process():
             self.browse_button.configure(state="disabled")
             self.cancel_button.configure(state="normal")
             self.open_folder_button.configure(state="disabled")
+            self.create_zip_check.configure(state="disabled")
+            self.keep_uncompressed_check.configure(state="disabled")
             self.status_var.set("Processing...")
 
             # Reset stats display
+            self.total_size_var.set("--")
             self.throughput_var.set("--")
             self.eta_var.set("--")
             self.progress_var.set("--")
@@ -331,7 +413,9 @@ if not _is_worker_process():
             self.output_text.configure(state="disabled")
 
             # Start processing in background thread
-            thread = threading.Thread(target=self._process_file, args=(zip_path,), daemon=True)
+            thread = threading.Thread(
+                target=self._process_file, args=(zip_path,), daemon=True
+            )
             thread.start()
 
         def _process_file(self, zip_path):
@@ -343,11 +427,18 @@ if not _is_worker_process():
             sys.stderr = self.redirector
 
             try:
-                success = process_zip(zip_path, cancel_check=self._check_cancel)
+                success = process_zip(
+                    zip_path,
+                    cancel_check=self._check_cancel,
+                    create_zip=self.create_zip_var.get(),
+                    keep_uncompressed=self.keep_uncompressed_var.get(),
+                )
 
                 # Schedule UI update on main thread
                 was_cancelled = self.cancel_requested
-                self.root.after(0, lambda: self._processing_complete(success, was_cancelled))
+                self.root.after(
+                    0, lambda: self._processing_complete(success, was_cancelled)
+                )
 
             except Exception as e:
                 print(f"\nError: {e}")
@@ -364,6 +455,8 @@ if not _is_worker_process():
             self.process_button.configure(state="normal")
             self.browse_button.configure(state="normal")
             self.cancel_button.configure(state="disabled")
+            self.create_zip_check.configure(state="normal")
+            self.keep_uncompressed_check.configure(state="normal")
 
             if was_cancelled:
                 self.status_var.set("Cancelled. No output created.")
@@ -385,7 +478,6 @@ if not _is_worker_process():
                     os.system(f'open "{self.output_dir}"')
                 else:
                     os.system(f'xdg-open "{self.output_dir}"')
-
 
     def main():
         """Main entry point for the GUI application."""

@@ -318,7 +318,10 @@ class LargeFileProgress:
 
     def _render_header(self):
         """Print header for large file processing."""
-        mode = f"(max {self.max_concurrent} concurrent)" if self.max_concurrent > 1 else "(sequential)"
+        if self.max_concurrent > 1:
+            mode = f"(max {self.max_concurrent} files concurrent)"
+        else:
+            mode = "(one at a time, parallel chunks)"
         print(f"\nProcessing {self.total_files} large file(s) ({self.total_size_mb:.1f} MB total) {mode}")
         print("-" * 75)
 
@@ -379,8 +382,8 @@ class LargeFileProgress:
 
             sys.stdout.write(
                 f"  DONE [{self.completed}/{self.total_files}]: {display_name} "
-                f"@ {file_throughput:.2f} MB/s ({replacements} repl) | "
-                f"Avg: {avg_throughput:.2f} MB/s{eta_str}\n"
+                f"({file_size_mb:.1f} MB @ {file_throughput:.2f} MB/s, {replacements} repl)"
+                f"{eta_str} | Avg: {avg_throughput:.2f} MB/s\n"
             )
             sys.stdout.flush()
 
@@ -652,6 +655,8 @@ def process_zip(
     zip_path: str,
     max_workers: Optional[int] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    create_zip: bool = True,
+    keep_uncompressed: bool = True,
 ) -> bool:
     """
     Main processing function with streaming writes for memory efficiency.
@@ -665,6 +670,8 @@ def process_zip(
         zip_path: Path to the zip file to process
         max_workers: Number of parallel workers (default: CPU count, max 8)
         cancel_check: Optional callback that returns True if processing should be cancelled
+        create_zip: Create a zip file from the output (default: True, for LogShark compatibility)
+        keep_uncompressed: Keep the uncompressed directory (default: True)
     """
     import shutil
 
@@ -727,17 +734,16 @@ def process_zip(
                     (output_dir / entry.filename).mkdir(parents=True, exist_ok=True)
 
             # Phase 1: Copy binary files directly (no processing needed)
+            # Silent copy - no progress bar needed for binary files
             if binary_entries:
                 check_cancelled()
-                progress = ProgressBar(len(binary_entries), "Copying binary")
                 for entry in binary_entries:
                     check_cancelled()
                     data = src_zip.read(entry.filename)
                     out_path = output_dir / entry.filename
                     out_path.parent.mkdir(parents=True, exist_ok=True)
                     out_path.write_bytes(data)
-                    progress.update()
-                progress.finish()
+                print(f"Copied {len(binary_entries)} binary files")
 
             # Phase 2: Process text files with memory-efficient streaming
             if text_entries:
@@ -819,7 +825,8 @@ def process_zip(
                                     entry = futures[future]
                                     errors.append(f"{entry.filename}: {e}")
                     else:
-                        # Process sequentially (memory constrained or single file)
+                        # Process one file at a time (memory constrained or single file)
+                        # Note: each file's content is still processed with parallel chunks
                         for entry in large_files:
                             check_cancelled()
                             process_large_file(entry)
@@ -895,11 +902,32 @@ def process_zip(
         # Calculate timing
         elapsed = time.time() - start_time
 
+        # Create zip file if requested (for LogShark compatibility)
+        output_zip_path = None
+        if create_zip:
+            output_zip_path = zip_path.parent / (zip_path.stem + "_anonymized.zip")
+            print(f"\nCreating output zip file...")
+            with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for file_path in output_dir.rglob('*'):
+                    if file_path.is_file():
+                        arcname = file_path.relative_to(output_dir)
+                        zf.write(file_path, arcname)
+            zip_size_mb = output_zip_path.stat().st_size / 1024 / 1024
+            print(f"Created: {output_zip_path.name} ({zip_size_mb:.1f} MB)")
+
+        # Remove uncompressed directory if not keeping it
+        if create_zip and not keep_uncompressed:
+            shutil.rmtree(output_dir)
+            output_dir = None
+
         # Print results
         print("\n" + "=" * 60)
         print("ANONYMIZATION COMPLETE")
         print("=" * 60)
-        print(f"\nOutput directory: {output_dir}")
+        if output_zip_path:
+            print(f"\nOutput zip: {output_zip_path}")
+        if output_dir and output_dir.exists():
+            print(f"Output directory: {output_dir}")
         print(f"Original zip size: {zip_path.stat().st_size / 1024 / 1024:.1f} MB")
         print(f"Files processed: {total_files}")
         print(f"Total time: {format_time(elapsed)}")
@@ -954,10 +982,25 @@ def main():
         default=None,
         help="Number of parallel workers (default: CPU count, max 8)",
     )
+    parser.add_argument(
+        "--no-zip",
+        action="store_true",
+        help="Don't create output zip file (only keep uncompressed directory)",
+    )
+    parser.add_argument(
+        "--no-uncompressed",
+        action="store_true",
+        help="Don't keep uncompressed directory (only create zip file)",
+    )
 
     args = parser.parse_args()
 
-    success = process_zip(args.zipfile, args.workers)
+    success = process_zip(
+        args.zipfile,
+        args.workers,
+        create_zip=not args.no_zip,
+        keep_uncompressed=not args.no_uncompressed,
+    )
     sys.exit(0 if success else 1)
 
 

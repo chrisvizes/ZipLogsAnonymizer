@@ -348,12 +348,33 @@ class FastAnonymizer:
         self.counts = defaultdict(int)
         self.unique_counters = defaultdict(dict)
 
+    # Map categories to natural-looking replacement formats
+    # These formats are designed to be compatible with tools like LogShark
+    # that expect valid-looking usernames, hostnames, etc.
+    REPLACEMENT_FORMATS = {
+        "username": "user{idx:03d}",          # user001, user002 - looks like a real username
+        "email": "user{idx:03d}",             # user001@redacted.com - looks like real email
+        "hostname": "host{idx:03d}",          # host001.redacted - looks like real hostname
+        "internal_ip": "10.{idx}.0.1",        # 10.1.0.1, 10.2.0.1 - valid internal IP, unlikely to collide
+        "tableau_entity": "entity{idx:03d}",  # entity001 - generic entity name
+    }
+
     def get_unique_replacement(self, category: str, original: str, template: str) -> str:
-        """Get consistent unique replacement for a value."""
+        """Get consistent unique replacement for a value.
+
+        Uses natural-looking formats that are compatible with log analysis tools.
+        Same original value always maps to the same replacement.
+        """
         if original not in self.unique_counters[category]:
             self.unique_counters[category][original] = len(self.unique_counters[category]) + 1
         idx = self.unique_counters[category][original]
-        return template.replace("{UNIQUE}", f"{category.upper()}_{idx:03d}")
+
+        # Use natural-looking format if available, otherwise fall back to default
+        if category in self.REPLACEMENT_FORMATS:
+            replacement = self.REPLACEMENT_FORMATS[category].format(idx=idx)
+            return template.replace("{UNIQUE}", replacement)
+        else:
+            return template.replace("{UNIQUE}", f"{category.upper()}_{idx:03d}")
 
     def apply_pattern(self, config: PatternConfig, text: str) -> str:
         """Apply a single pattern to text, tracking counts."""
