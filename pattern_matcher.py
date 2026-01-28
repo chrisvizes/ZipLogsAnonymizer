@@ -393,52 +393,77 @@ class FastAnonymizer:
         """Process content with all optimizations."""
         self.reset()
 
-        # Fast path: skip content with no potential matches
-        if not self.matcher.content_may_have_matches(content):
+        # OPTIMIZATION: Lowercase entire content ONCE (not per-line)
+        content_lower = content.lower()
+
+        # Pre-fetch to avoid attribute lookup in hot loop
+        all_keywords = self.matcher._all_keywords_lower
+        keyword_to_patterns = self.matcher._keyword_to_patterns
+
+        # OPTIMIZATION: Find ONLY keywords that exist in this content block
+        # This reduces per-line checks from ~25 keywords to typically 1-3
+        present_keywords = [kw for kw in all_keywords if kw in content_lower]
+
+        # Fast path: no keywords present anywhere
+        if not present_keywords:
             return content, {}
 
         # PHASE 1: Apply multiline patterns to full content
         for config in self.matcher._multiline_patterns:
-            content_lower = content.lower()
             if any(kw in content_lower for kw in config.required_keywords):
                 content = self.apply_pattern(config, content)
+                # Update content_lower after multiline modifications
+                content_lower = content.lower()
+
+        # Build set of applicable pattern IDs based on present keywords only
+        present_pattern_ids = set()
+        present_patterns_list = []
+        for kw in present_keywords:
+            for pattern in keyword_to_patterns.get(kw, []):
+                if not pattern.multiline and id(pattern) not in present_pattern_ids:
+                    present_pattern_ids.add(id(pattern))
+                    present_patterns_list.append(pattern)
+
+        # Fast path: no single-line patterns apply
+        if not present_pattern_ids:
+            return content, dict(self.counts)
 
         # PHASE 2: Batch line processing for single-line patterns
-        # Process in batches to reduce loop overhead
+        # Optimized: track modifications to avoid unnecessary string joins
         lines = content.split("\n")
-        result_lines = []
+        lines_lower = content_lower.split("\n")
 
-        # Pre-fetch pattern list to avoid attribute lookup in loop
-        single_patterns = self.matcher._single_line_patterns
-        all_keywords = self.matcher._all_keywords_lower
-        keyword_to_patterns = self.matcher._keyword_to_patterns
+        # Track if any line was modified
+        any_modified = False
 
-        for line in lines:
+        for i, line in enumerate(lines):
             if not line:
-                result_lines.append(line)
                 continue
 
-            # Single .lower() call per line
-            line_lower = line.lower()
+            # OPTIMIZATION: Use pre-computed lowercase from content_lower split
+            line_lower = lines_lower[i]
 
-            # Fast keyword check - find which keywords are present
-            present_keywords = [kw for kw in all_keywords if kw in line_lower]
+            # OPTIMIZATION: Only check keywords that exist in this content block
+            has_keyword = False
+            for kw in present_keywords:
+                if kw in line_lower:
+                    has_keyword = True
+                    break
 
-            if not present_keywords:
-                result_lines.append(line)
+            if not has_keyword:
                 continue
 
-            # Get unique applicable patterns
+            # Collect applicable patterns (only for lines with keywords)
             seen_patterns = set()
             applicable = []
             for kw in present_keywords:
-                for pattern in keyword_to_patterns.get(kw, []):
-                    if not pattern.multiline and id(pattern) not in seen_patterns:
-                        seen_patterns.add(id(pattern))
-                        applicable.append(pattern)
+                if kw in line_lower:
+                    for pattern in keyword_to_patterns.get(kw, []):
+                        if id(pattern) in present_pattern_ids and id(pattern) not in seen_patterns:
+                            seen_patterns.add(id(pattern))
+                            applicable.append(pattern)
 
             if not applicable:
-                result_lines.append(line)
                 continue
 
             # Apply patterns to line
@@ -446,9 +471,16 @@ class FastAnonymizer:
             for config in applicable:
                 modified = self.apply_pattern(config, modified)
 
-            result_lines.append(modified)
+            # Only update if actually changed
+            if modified != line:
+                lines[i] = modified
+                any_modified = True
 
-        return "\n".join(result_lines), dict(self.counts)
+        # Only join if modifications were made
+        if any_modified:
+            return "\n".join(lines), dict(self.counts)
+        else:
+            return content, dict(self.counts)
 
 
 # Module-level fast anonymizer cache (one per process)

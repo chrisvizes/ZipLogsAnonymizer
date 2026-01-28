@@ -63,8 +63,81 @@ LARGE_FILE_THRESHOLD = (
 )  # 5MB - larger files use thread pool instead of serial
 
 # Memory safety settings
-MEMORY_SAFETY_FACTOR = 3.0  # Assume each file needs ~3x its size in memory (read + decode + output)
-MIN_FREE_MEMORY_MB = 500  # Always keep at least 500MB free
+MEMORY_SAFETY_FACTOR = 2.0  # Assume each file needs ~2x its size in memory (read + output buffer)
+MIN_FREE_MEMORY_MB = 400  # Always keep at least 400MB free
+
+# Parallel processing settings
+MIN_PARALLEL_SIZE_MB = 10  # Only parallelize files larger than this
+PARALLEL_CHUNK_LINES = 50000  # Lines per chunk for parallel processing
+
+
+def _process_lines_chunk(args: tuple) -> tuple[list[str], dict[str, int]]:
+    """
+    Process a chunk of lines in a worker process.
+
+    Must be at module level to be picklable for ProcessPoolExecutor.
+
+    Args:
+        args: Tuple of (lines_chunk, present_keywords)
+
+    Returns:
+        Tuple of (processed_lines, replacement_counts)
+    """
+    lines_chunk, present_keywords = args
+
+    # Import inside worker to get fresh matcher per process
+    from pattern_matcher import PatternMatcher, FastAnonymizer
+
+    matcher = PatternMatcher()
+    anonymizer = FastAnonymizer(matcher)
+
+    keyword_to_patterns = matcher._keyword_to_patterns
+
+    # Build applicable pattern IDs from present keywords
+    present_pattern_ids = set()
+    for kw in present_keywords:
+        for pattern in keyword_to_patterns.get(kw, []):
+            if not pattern.multiline:
+                present_pattern_ids.add(id(pattern))
+
+    # Process lines in-place
+    for i, line in enumerate(lines_chunk):
+        if not line:
+            continue
+
+        line_lower = line.lower()
+
+        # Check for keywords
+        has_keyword = False
+        for kw in present_keywords:
+            if kw in line_lower:
+                has_keyword = True
+                break
+
+        if not has_keyword:
+            continue
+
+        # Collect applicable patterns
+        seen_patterns = set()
+        applicable = []
+        for kw in present_keywords:
+            if kw in line_lower:
+                for pattern in keyword_to_patterns.get(kw, []):
+                    if id(pattern) in present_pattern_ids and id(pattern) not in seen_patterns:
+                        seen_patterns.add(id(pattern))
+                        applicable.append(pattern)
+
+        if not applicable:
+            continue
+
+        modified = line
+        for config in applicable:
+            modified = anonymizer.apply_pattern(config, modified)
+
+        if modified != line:
+            lines_chunk[i] = modified
+
+    return lines_chunk, dict(anonymizer.counts)
 
 
 def get_available_memory_mb() -> float:
@@ -428,76 +501,146 @@ def process_large_file_streaming(
         # Create a fresh anonymizer for this file
         anonymizer = FastAnonymizer(matcher)
 
-        # Process in chunks and write incrementally
-        CHUNK_LINES = 10000  # Process 10k lines at a time
-        lines = content.split("\n")
-        total_lines = len(lines)
-
         # Pre-fetch for hot loop
         multiline_patterns = matcher._multiline_patterns
         all_keywords = matcher._all_keywords_lower
         keyword_to_patterns = matcher._keyword_to_patterns
 
+        # OPTIMIZATION: Scan for present keywords, then discard lowercase content
+        # This avoids keeping 2x memory for large files
+        content_lower_temp = content.lower()
+        present_keywords = [kw for kw in all_keywords if kw in content_lower_temp]
+
+        # Fast path: no keywords present anywhere in file
+        if not present_keywords:
+            del content_lower_temp  # Free memory immediately
+            output_path.write_text(content, encoding="utf-8")
+            return {}, None
+
         # First pass: handle multiline patterns on full content
         for config in multiline_patterns:
-            content_lower = content.lower()
-            if any(kw in content_lower for kw in config.required_keywords):
+            if any(kw in content_lower_temp for kw in config.required_keywords):
                 content = anonymizer.apply_pattern(config, content)
+                content_lower_temp = content.lower()  # Update after modification
 
-        # Re-split after multiline processing
+        # Build set of applicable pattern IDs based on present keywords only
+        present_pattern_ids = set()
+        for kw in present_keywords:
+            for pattern in keyword_to_patterns.get(kw, []):
+                if not pattern.multiline:
+                    present_pattern_ids.add(id(pattern))
+
+        # Free the large lowercase string - we'll lowercase per-chunk instead
+        del content_lower_temp
+
+        # Fast path: no single-line patterns apply
+        if not present_pattern_ids:
+            output_path.write_text(content, encoding="utf-8")
+            return dict(anonymizer.counts), None
+
+        # Split content into lines
         lines = content.split("\n")
+        total_lines = len(lines)
 
-        # Process and write in chunks
-        with open(
-            output_path, "w", encoding="utf-8", buffering=1024 * 1024
-        ) as f:  # 1MB buffer
-            chunk_start = 0
-            while chunk_start < total_lines:
-                chunk_end = min(chunk_start + CHUNK_LINES, total_lines)
-                chunk_lines = lines[chunk_start:chunk_end]
+        # Free original content string - we have it in lines now
+        del content
 
-                result_lines = []
-                for line in chunk_lines:
-                    if not line:
-                        result_lines.append(line)
-                        continue
+        # Determine if parallel processing is beneficial
+        # Only parallelize if file is large enough (>10MB of lines)
+        content_size_mb = sum(len(line) for line in lines) / (1024 * 1024)
+        num_workers = min(4, multiprocessing.cpu_count())
+        use_parallel = content_size_mb >= MIN_PARALLEL_SIZE_MB and num_workers >= 2
 
-                    line_lower = line.lower()
-                    present_keywords = [kw for kw in all_keywords if kw in line_lower]
+        if use_parallel:
+            # PARALLEL PROCESSING: Split into chunks and process in parallel
+            chunk_size = max(PARALLEL_CHUNK_LINES, total_lines // num_workers)
+            chunks = []
+            for i in range(0, total_lines, chunk_size):
+                chunk = lines[i:i + chunk_size]
+                chunks.append((chunk, present_keywords))
 
-                    if not present_keywords:
-                        result_lines.append(line)
-                        continue
+            # Process chunks in parallel
+            all_counts: dict[str, int] = defaultdict(int)
+            processed_chunks = []
 
-                    # Get applicable patterns
-                    seen_patterns = set()
-                    applicable = []
-                    for kw in present_keywords:
-                        for pattern in keyword_to_patterns.get(kw, []):
-                            if (
-                                not pattern.multiline
-                                and id(pattern) not in seen_patterns
-                            ):
-                                seen_patterns.add(id(pattern))
-                                applicable.append(pattern)
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                results = list(executor.map(_process_lines_chunk, chunks))
 
-                    if not applicable:
-                        result_lines.append(line)
-                        continue
+            for processed_lines, chunk_counts in results:
+                processed_chunks.append(processed_lines)
+                for cat, count in chunk_counts.items():
+                    all_counts[cat] += count
 
-                    modified = line
-                    for config in applicable:
-                        modified = anonymizer.apply_pattern(config, modified)
-                    result_lines.append(modified)
+            # Write all processed chunks to file
+            with open(output_path, "w", encoding="utf-8", buffering=4 * 1024 * 1024) as f:
+                first = True
+                for chunk in processed_chunks:
+                    if not first:
+                        f.write("\n")
+                    f.write("\n".join(chunk))
+                    first = False
 
-                # Write chunk
-                if chunk_start > 0:
-                    f.write("\n")
-                f.write("\n".join(result_lines))
+            return dict(all_counts), None
 
-                chunk_start = chunk_end
+        else:
+            # SEQUENTIAL PROCESSING: For smaller files, process in-place
+            CHUNK_LINES = 25000
 
-        return dict(anonymizer.counts), None
+            with open(
+                output_path, "w", encoding="utf-8", buffering=4 * 1024 * 1024
+            ) as f:
+                chunk_start = 0
+                first_chunk = True
+                while chunk_start < total_lines:
+                    chunk_end = min(chunk_start + CHUNK_LINES, total_lines)
+                    chunk_lines = lines[chunk_start:chunk_end]
+
+                    # Process in-place using only present keywords
+                    for i, line in enumerate(chunk_lines):
+                        if not line:
+                            continue
+
+                        line_lower = line.lower()
+
+                        has_keyword = False
+                        for kw in present_keywords:
+                            if kw in line_lower:
+                                has_keyword = True
+                                break
+
+                        if not has_keyword:
+                            continue
+
+                        seen_patterns = set()
+                        applicable = []
+                        for kw in present_keywords:
+                            if kw in line_lower:
+                                for pattern in keyword_to_patterns.get(kw, []):
+                                    if (
+                                        id(pattern) in present_pattern_ids
+                                        and id(pattern) not in seen_patterns
+                                    ):
+                                        seen_patterns.add(id(pattern))
+                                        applicable.append(pattern)
+
+                        if not applicable:
+                            continue
+
+                        modified = line
+                        for config in applicable:
+                            modified = anonymizer.apply_pattern(config, modified)
+
+                        if modified != line:
+                            chunk_lines[i] = modified
+
+                    if not first_chunk:
+                        f.write("\n")
+                    f.write("\n".join(chunk_lines))
+                    first_chunk = False
+
+                    chunk_start = chunk_end
+
+            return dict(anonymizer.counts), None
 
     except Exception as e:
         # On error, write original data
@@ -598,7 +741,7 @@ def process_zip(
 
             # Phase 2: Process text files with memory-efficient streaming
             if text_entries:
-                # Separate large files (process serially) from small files (process in parallel)
+                # Separate large files (memory-aware threading) from small files (multiprocessing)
                 large_files = [
                     e for e in text_entries if e.file_size >= LARGE_FILE_THRESHOLD
                 ]

@@ -18,9 +18,9 @@ This tool processes zip files containing logs (typically from Tableau Server or 
 
 **No Python or technical setup required.**
 
-### Mac / Linux - Command Line
+### Mac / Linux / Windows - Command Line
 
-Mac and Linux users can run the tool directly from the command line:
+Mac and Linux (and Windows) users can run the tool directly from the command line:
 
 ```bash
 # 1. Ensure Python 3.8+ is installed
@@ -145,9 +145,9 @@ The tool is designed to handle large log archives (500MB - 2GB zips containing t
 
 | Challenge              | Solution                                                                                                                                      |
 | ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Memory usage**       | Stream processing - files are read, processed, and written one at a time rather than loading the entire zip into memory                       |
-| **Large files (>5MB)** | Processed serially in the main process to avoid overhead of serializing large data to worker processes                                        |
-| **Small files**        | Processed in parallel across multiple CPU cores (up to 8 workers)                                                                             |
+| **Memory usage**       | Memory-aware concurrency - automatically limits parallel processing based on available RAM to prevent out-of-memory errors                    |
+| **Large files (>5MB)** | Processed with ThreadPoolExecutor using memory-safe concurrency; very large files (>20MB) use streaming to reduce memory pressure             |
+| **Small files**        | Processed in parallel across multiple CPU cores (up to 16 concurrent)                                                                         |
 | **Regex performance**  | Pre-filtering with keyword checks - lines without relevant keywords (like `@`, `password`, `jdbc:`) skip regex entirely, reducing work by ~5x |
 | **Pattern matching**   | Line-by-line processing with early exit - each line only runs against patterns whose keywords appear in that line                             |
 

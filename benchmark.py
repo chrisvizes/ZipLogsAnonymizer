@@ -80,16 +80,23 @@ class PhaseMetrics:
 class BenchmarkReport:
     """Complete benchmark report."""
     zip_path: str
-    zip_size_mb: float
+    zip_compressed_size_mb: float  # Compressed zip file size
+    zip_uncompressed_size_mb: float  # Total uncompressed size of all files
     total_files: int
     text_files: int
     binary_files: int
     large_files: int
     small_files: int
 
+    # Size breakdowns (all uncompressed)
+    text_files_size_mb: float = 0.0
+    binary_files_size_mb: float = 0.0
+    large_files_size_mb: float = 0.0
+    small_files_size_mb: float = 0.0
+
     # Timing
     total_time_seconds: float = 0.0
-    overall_throughput_mb_s: float = 0.0
+    overall_throughput_mb_s: float = 0.0  # Based on uncompressed size
 
     # Phase breakdown
     phases: dict = field(default_factory=dict)
@@ -109,6 +116,7 @@ class BenchmarkReport:
     # System info
     cpu_count: int = 0
     platform: str = ""
+    initial_available_memory_mb: float = 0.0
 
     # Accuracy verification (if test data used)
     accuracy_verified: bool = False
@@ -299,16 +307,13 @@ def run_benchmark(
         get_available_memory_mb
     )
 
-    print(f"\n{'='*70}")
-    print("BENCHMARK START")
-    print(f"{'='*70}")
-    print(f"File: {zip_path}")
-    print(f"Size: {zip_path.stat().st_size / (1024*1024):.1f} MB")
-    print(f"Available memory: {get_available_memory_mb():.0f} MB")
-    print(f"CPU cores: {multiprocessing.cpu_count()}")
-    print(f"{'='*70}\n")
+    initial_memory = get_available_memory_mb()
 
-    # Analyze zip structure
+    # Analyze zip structure FIRST to get accurate sizes
+    print(f"\n{'='*70}")
+    print("ANALYZING ZIP STRUCTURE")
+    print(f"{'='*70}")
+
     with zipfile.ZipFile(zip_path, 'r') as zf:
         entries = [e for e in zf.infolist() if not e.is_dir()]
         total_files = len(entries)
@@ -325,20 +330,47 @@ def run_benchmark(
         large_files = [e for e in text_files if e.file_size >= LARGE_FILE_THRESHOLD]
         small_files = [e for e in text_files if e.file_size < LARGE_FILE_THRESHOLD]
 
-    # Initialize report
+    # Calculate sizes (uncompressed = file_size, compressed = compress_size)
+    compressed_size_mb = zip_path.stat().st_size / (1024 * 1024)
+    total_uncompressed_mb = sum(e.file_size for e in entries) / (1024 * 1024)
+    text_files_size_mb = sum(e.file_size for e in text_files) / (1024 * 1024)
+    binary_files_size_mb = sum(e.file_size for e in binary_files) / (1024 * 1024)
+    large_files_size_mb = sum(e.file_size for e in large_files) / (1024 * 1024)
+    small_files_size_mb = sum(e.file_size for e in small_files) / (1024 * 1024)
+
+    compression_ratio = total_uncompressed_mb / compressed_size_mb if compressed_size_mb > 0 else 1.0
+
+    print(f"File: {zip_path}")
+    print(f"Compressed size: {compressed_size_mb:.1f} MB")
+    print(f"Uncompressed size: {total_uncompressed_mb:.1f} MB (ratio: {compression_ratio:.1f}x)")
+    print(f"  - Text files: {text_files_size_mb:.1f} MB ({len(text_files)} files)")
+    print(f"    - Large (>{LARGE_FILE_THRESHOLD//(1024*1024)}MB): {large_files_size_mb:.1f} MB ({len(large_files)} files)")
+    print(f"    - Small: {small_files_size_mb:.1f} MB ({len(small_files)} files)")
+    print(f"  - Binary files: {binary_files_size_mb:.1f} MB ({len(binary_files)} files)")
+    print(f"Available memory: {initial_memory:.0f} MB")
+    print(f"CPU cores: {multiprocessing.cpu_count()}")
+    print(f"{'='*70}\n")
+
+    # Initialize report with uncompressed sizes
     report = BenchmarkReport(
         zip_path=str(zip_path),
-        zip_size_mb=zip_path.stat().st_size / (1024 * 1024),
+        zip_compressed_size_mb=compressed_size_mb,
+        zip_uncompressed_size_mb=total_uncompressed_mb,
         total_files=total_files,
         text_files=len(text_files),
         binary_files=len(binary_files),
         large_files=len(large_files),
         small_files=len(small_files),
+        text_files_size_mb=text_files_size_mb,
+        binary_files_size_mb=binary_files_size_mb,
+        large_files_size_mb=large_files_size_mb,
+        small_files_size_mb=small_files_size_mb,
         cpu_count=multiprocessing.cpu_count(),
         platform=sys.platform,
+        initial_available_memory_mb=initial_memory,
     )
 
-    # Start memory monitoring
+    # Start memory monitoring BEFORE processing begins
     mem_monitor = MemoryMonitor(interval_seconds=0.5)
     mem_monitor.start()
 
@@ -351,9 +383,9 @@ def run_benchmark(
 
     end_time = time.time()
 
-    # Collect metrics
+    # Collect metrics - use UNCOMPRESSED size for throughput
     report.total_time_seconds = end_time - start_time
-    report.overall_throughput_mb_s = report.zip_size_mb / report.total_time_seconds if report.total_time_seconds > 0 else 0
+    report.overall_throughput_mb_s = total_uncompressed_mb / report.total_time_seconds if report.total_time_seconds > 0 else 0
 
     report.peak_memory_mb = mem_monitor.get_peak_used()
     report.min_available_memory_mb = mem_monitor.get_min_available()
@@ -403,19 +435,39 @@ def print_report(report: BenchmarkReport):
     print("BENCHMARK REPORT")
     print(f"{'='*70}")
 
+    # Calculate compression ratio
+    compression_ratio = report.zip_uncompressed_size_mb / report.zip_compressed_size_mb if report.zip_compressed_size_mb > 0 else 1.0
+
     print(f"\nFILE SUMMARY:")
     print(f"  Total files: {report.total_files}")
     print(f"  Text files: {report.text_files} (large: {report.large_files}, small: {report.small_files})")
     print(f"  Binary files: {report.binary_files}")
-    print(f"  Zip size: {report.zip_size_mb:.1f} MB")
+    print(f"  Compressed size: {report.zip_compressed_size_mb:.1f} MB")
+    print(f"  Uncompressed size: {report.zip_uncompressed_size_mb:.1f} MB (ratio: {compression_ratio:.1f}x)")
+
+    print(f"\nSIZE BREAKDOWN (uncompressed):")
+    print(f"  Text files: {report.text_files_size_mb:.1f} MB")
+    print(f"    - Large files: {report.large_files_size_mb:.1f} MB ({report.large_files} files)")
+    print(f"    - Small files: {report.small_files_size_mb:.1f} MB ({report.small_files} files)")
+    print(f"  Binary files: {report.binary_files_size_mb:.1f} MB")
 
     print(f"\nPERFORMANCE:")
     print(f"  Total time: {report.total_time_seconds:.1f} seconds ({report.total_time_seconds/60:.1f} min)")
-    print(f"  Overall throughput: {report.overall_throughput_mb_s:.2f} MB/s")
+    print(f"  Overall throughput: {report.overall_throughput_mb_s:.2f} MB/s (based on uncompressed size)")
+
+    # Calculate what throughput would be needed to hit 30 min target
+    if report.zip_uncompressed_size_mb > 0 and report.total_time_seconds > 0:
+        target_30_min_throughput = report.zip_uncompressed_size_mb / (30 * 60)
+        speedup_needed = target_30_min_throughput / report.overall_throughput_mb_s if report.overall_throughput_mb_s > 0 else 0
+        print(f"  Target for 30 min: {target_30_min_throughput:.2f} MB/s ({speedup_needed:.1f}x speedup needed)")
 
     print(f"\nMEMORY:")
+    print(f"  Initial available: {report.initial_available_memory_mb:.0f} MB")
     print(f"  Peak memory used: {report.peak_memory_mb:.0f} MB")
     print(f"  Min available: {report.min_available_memory_mb:.0f} MB")
+    if report.initial_available_memory_mb > 0 and report.min_available_memory_mb > 0:
+        memory_consumed = report.initial_available_memory_mb - report.min_available_memory_mb
+        print(f"  Memory consumed: {memory_consumed:.0f} MB")
 
     print(f"\nSYSTEM:")
     print(f"  Platform: {report.platform}")

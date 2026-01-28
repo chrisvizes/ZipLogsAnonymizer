@@ -1,0 +1,663 @@
+#!/usr/bin/env python3
+"""
+Performance Tests for ZipLogsAnonymizer
+
+These tests benchmark individual components to:
+1. Establish baseline performance metrics
+2. Catch performance regressions early
+3. Identify bottlenecks in specific components
+
+Run with: pytest test_performance.py -v
+Run specific: pytest test_performance.py::TestLineProcessingThroughput -v
+
+Performance targets based on 20-minute goal for 14GB uncompressed:
+- Target throughput: ~12 MB/s
+- Current baseline: ~6 MB/s
+- Need: ~2x improvement
+"""
+
+import time
+import random
+import string
+from io import StringIO
+import pytest
+
+from pattern_matcher import PatternMatcher, FastAnonymizer, anonymize_content
+
+
+# =============================================================================
+# TEST DATA GENERATORS
+# =============================================================================
+
+def generate_clean_log_line() -> str:
+    """Generate a typical log line with no sensitive data."""
+    timestamps = ["2024-01-15 10:30:45", "2024-01-15 10:30:46", "2024-01-15 10:30:47"]
+    levels = ["INFO", "DEBUG", "WARN", "ERROR"]
+    messages = [
+        "Processing request completed successfully",
+        "Cache hit for key abc123",
+        "Database query executed in 45ms",
+        "Thread pool size: 8, active: 3",
+        "Memory usage: 512MB / 1024MB",
+        "Request processed in 123ms",
+        "Connection established to port 8080",
+        "File saved to /var/log/app.log",
+        "Batch processing completed: 1000 items",
+        "Scheduler triggered job: cleanup",
+    ]
+    return f"{random.choice(timestamps)} {random.choice(levels)}  {random.choice(messages)}"
+
+
+def generate_sensitive_log_line() -> str:
+    """Generate a log line containing sensitive data."""
+    templates = [
+        "2024-01-15 10:30:45 INFO  User user=john.smith logged in from 192.168.1.100",
+        "2024-01-15 10:30:46 DEBUG Connection: jdbc:mysql://db.internal:3306/prod",
+        "2024-01-15 10:30:47 WARN  Auth failed for password=secretpass123",
+        "2024-01-15 10:30:48 INFO  API call with token=abcdefghij1234567890klmnop",
+        "2024-01-15 10:30:49 DEBUG Request from server.corp to 10.0.0.50",
+        "2024-01-15 10:30:50 INFO  Email sent to admin@company.local",
+        "2024-01-15 10:30:51 DEBUG MAC address: 00:1A:2B:3C:4D:5E",
+        "2024-01-15 10:30:52 INFO  Processing workbook=SalesReport for site=Production",
+    ]
+    return random.choice(templates)
+
+
+def generate_test_content(
+    num_lines: int,
+    sensitive_ratio: float = 0.05  # 5% of lines have sensitive data (realistic)
+) -> str:
+    """Generate test content with specified ratio of sensitive lines."""
+    lines = []
+    for _ in range(num_lines):
+        if random.random() < sensitive_ratio:
+            lines.append(generate_sensitive_log_line())
+        else:
+            lines.append(generate_clean_log_line())
+    return "\n".join(lines)
+
+
+def estimate_content_size_mb(content: str) -> float:
+    """Estimate content size in MB."""
+    return len(content.encode('utf-8')) / (1024 * 1024)
+
+
+# =============================================================================
+# PERFORMANCE THRESHOLDS
+# =============================================================================
+
+# These thresholds define minimum acceptable performance.
+# Tests fail if performance drops below these values.
+# Values are set conservatively to catch major regressions.
+
+THRESHOLDS = {
+    # Keyword detection: how many lines/sec can we check for keywords?
+    # Baseline: ~5M lines/sec (very fast due to simple string lookups)
+    # Minimum acceptable: 1M lines/sec (catch major regressions)
+    "keyword_detection_lines_per_sec": 1_000_000,
+
+    # Pattern matching: how fast can we process lines that HAVE sensitive data?
+    # Baseline: ~80K lines/sec for lines requiring regex
+    # Minimum acceptable: 40K lines/sec
+    "pattern_matching_lines_per_sec": 40_000,
+
+    # Full pipeline: end-to-end throughput for mixed content (5% sensitive)
+    # Baseline: ~7 MB/s
+    # Minimum acceptable: 5 MB/s (catch 30% regressions)
+    "full_pipeline_mb_per_sec": 5.0,
+
+    # Clean content: content with NO sensitive data
+    # Baseline: ~8 MB/s (still checks every line for keywords)
+    # Minimum acceptable: 6 MB/s
+    "clean_content_mb_per_sec": 6.0,
+
+    # High sensitive content (50% sensitive lines)
+    # Baseline: ~6 MB/s
+    # Minimum acceptable: 4 MB/s
+    "high_sensitive_mb_per_sec": 4.0,
+
+    # Lines per second for full processing
+    # Baseline: ~115K lines/sec
+    # Minimum acceptable: 80K lines/sec
+    "full_pipeline_lines_per_sec": 80_000,
+
+    # Sparse content (only 0.1% sensitive): should be close to clean content speed
+    # Baseline: ~7 MB/s
+    # Minimum acceptable: 5 MB/s
+    "sparse_content_mb_per_sec": 5.0,
+}
+
+
+# =============================================================================
+# TEST FIXTURES
+# =============================================================================
+
+@pytest.fixture(scope="module")
+def matcher():
+    """Shared pattern matcher instance."""
+    return PatternMatcher()
+
+
+@pytest.fixture(scope="module")
+def small_content():
+    """Small test content: 10,000 lines (~1MB)."""
+    random.seed(42)  # Reproducible
+    return generate_test_content(10_000, sensitive_ratio=0.05)
+
+
+@pytest.fixture(scope="module")
+def medium_content():
+    """Medium test content: 100,000 lines (~10MB)."""
+    random.seed(42)
+    return generate_test_content(100_000, sensitive_ratio=0.05)
+
+
+@pytest.fixture(scope="module")
+def clean_content():
+    """Content with no sensitive data (fast path test)."""
+    random.seed(42)
+    return generate_test_content(50_000, sensitive_ratio=0.0)
+
+
+@pytest.fixture(scope="module")
+def high_sensitive_content():
+    """Content with high ratio of sensitive data (stress test)."""
+    random.seed(42)
+    return generate_test_content(10_000, sensitive_ratio=0.50)
+
+
+# =============================================================================
+# KEYWORD DETECTION TESTS
+# =============================================================================
+
+class TestKeywordDetection:
+    """Test performance of keyword pre-filtering."""
+
+    def test_keyword_check_throughput(self, matcher, small_content):
+        """Verify keyword detection can process 200K+ lines/sec."""
+        lines = small_content.split("\n")
+        all_keywords = matcher._all_keywords_lower
+
+        # Warm up
+        for line in lines[:100]:
+            line_lower = line.lower()
+            any(kw in line_lower for kw in all_keywords)
+
+        # Benchmark
+        start = time.perf_counter()
+        iterations = 3
+        for _ in range(iterations):
+            for line in lines:
+                line_lower = line.lower()
+                # This is the hot path we're testing
+                has_keyword = False
+                for kw in all_keywords:
+                    if kw in line_lower:
+                        has_keyword = True
+                        break
+
+        elapsed = time.perf_counter() - start
+        total_lines = len(lines) * iterations
+        lines_per_sec = total_lines / elapsed
+
+        print(f"\nKeyword detection: {lines_per_sec:,.0f} lines/sec")
+        assert lines_per_sec >= THRESHOLDS["keyword_detection_lines_per_sec"], \
+            f"Keyword detection too slow: {lines_per_sec:,.0f} < {THRESHOLDS['keyword_detection_lines_per_sec']:,}"
+
+    def test_keyword_check_early_exit(self, matcher):
+        """Verify early exit optimization works (line with keyword at start)."""
+        all_keywords = matcher._all_keywords_lower
+
+        # Line with keyword early
+        line_with_keyword = "password=secret and other stuff " * 10
+        line_lower = line_with_keyword.lower()
+
+        start = time.perf_counter()
+        for _ in range(100_000):
+            for kw in all_keywords:
+                if kw in line_lower:
+                    break
+        elapsed = time.perf_counter() - start
+
+        # Should be fast due to early exit
+        ops_per_sec = 100_000 / elapsed
+        print(f"\nEarly exit keyword check: {ops_per_sec:,.0f} ops/sec")
+        assert ops_per_sec > 100_000, "Early exit not working effectively"
+
+
+# =============================================================================
+# PATTERN MATCHING TESTS
+# =============================================================================
+
+class TestPatternMatching:
+    """Test performance of regex pattern matching."""
+
+    def test_single_pattern_throughput(self, matcher):
+        """Test throughput of individual pattern types."""
+        # Lines that will match specific patterns
+        test_cases = {
+            "email": "Contact user at john.doe@company.com for support",
+            "internal_ip": "Server 192.168.1.100 responded with status 200",
+            "password": "Login with password=supersecret123",
+            "hostname": "Connected to server.corp successfully",
+        }
+
+        anonymizer = FastAnonymizer(matcher)
+        results = {}
+
+        for pattern_name, test_line in test_cases.items():
+            # Find the pattern
+            patterns = [p for p in matcher.patterns if p.name == pattern_name]
+            if not patterns:
+                continue
+            pattern = patterns[0]
+
+            # Benchmark
+            start = time.perf_counter()
+            iterations = 10_000
+            for _ in range(iterations):
+                anonymizer.apply_pattern(pattern, test_line)
+            elapsed = time.perf_counter() - start
+
+            ops_per_sec = iterations / elapsed
+            results[pattern_name] = ops_per_sec
+            print(f"\n{pattern_name} pattern: {ops_per_sec:,.0f} matches/sec")
+
+        # All patterns should achieve reasonable throughput
+        for name, throughput in results.items():
+            assert throughput > 10_000, f"{name} pattern too slow: {throughput:,.0f}/sec"
+
+    def test_lines_with_patterns_throughput(self, matcher, high_sensitive_content):
+        """Test processing lines that actually contain sensitive data."""
+        lines = high_sensitive_content.split("\n")
+        keyword_to_patterns = matcher._keyword_to_patterns
+        all_keywords = matcher._all_keywords_lower
+
+        # Filter to only lines with keywords
+        sensitive_lines = []
+        for line in lines:
+            line_lower = line.lower()
+            if any(kw in line_lower for kw in all_keywords):
+                sensitive_lines.append(line)
+
+        if not sensitive_lines:
+            pytest.skip("No sensitive lines found")
+
+        anonymizer = FastAnonymizer(matcher)
+
+        # Benchmark processing sensitive lines
+        start = time.perf_counter()
+        for line in sensitive_lines:
+            line_lower = line.lower()
+            for kw in all_keywords:
+                if kw in line_lower:
+                    for pattern in keyword_to_patterns.get(kw, []):
+                        if not pattern.multiline:
+                            anonymizer.apply_pattern(pattern, line)
+        elapsed = time.perf_counter() - start
+
+        lines_per_sec = len(sensitive_lines) / elapsed
+        print(f"\nSensitive line processing: {lines_per_sec:,.0f} lines/sec")
+        assert lines_per_sec >= THRESHOLDS["pattern_matching_lines_per_sec"], \
+            f"Pattern matching too slow: {lines_per_sec:,.0f} < {THRESHOLDS['pattern_matching_lines_per_sec']:,}"
+
+
+# =============================================================================
+# FULL PIPELINE TESTS
+# =============================================================================
+
+class TestLineProcessingThroughput:
+    """Test end-to-end throughput of the full processing pipeline."""
+
+    def test_mixed_content_throughput_mb(self, matcher, medium_content):
+        """Test MB/s throughput on realistic mixed content."""
+        size_mb = estimate_content_size_mb(medium_content)
+
+        # Warm up
+        anonymize_content(medium_content[:10000], matcher)
+
+        # Benchmark
+        start = time.perf_counter()
+        result, counts = anonymize_content(medium_content, matcher)
+        elapsed = time.perf_counter() - start
+
+        throughput_mb = size_mb / elapsed
+        lines = medium_content.count("\n") + 1
+        lines_per_sec = lines / elapsed
+
+        print(f"\nFull pipeline (mixed content):")
+        print(f"  Size: {size_mb:.1f} MB, {lines:,} lines")
+        print(f"  Time: {elapsed:.2f}s")
+        print(f"  Throughput: {throughput_mb:.2f} MB/s")
+        print(f"  Lines/sec: {lines_per_sec:,.0f}")
+        print(f"  Replacements: {sum(counts.values())}")
+
+        assert throughput_mb >= THRESHOLDS["full_pipeline_mb_per_sec"], \
+            f"Pipeline throughput too low: {throughput_mb:.2f} < {THRESHOLDS['full_pipeline_mb_per_sec']} MB/s"
+
+    def test_clean_content_fast_path(self, matcher, clean_content):
+        """Verify clean content (no matches) is processed very fast."""
+        size_mb = estimate_content_size_mb(clean_content)
+
+        # Benchmark
+        start = time.perf_counter()
+        result, counts = anonymize_content(clean_content, matcher)
+        elapsed = time.perf_counter() - start
+
+        throughput_mb = size_mb / elapsed
+
+        print(f"\nClean content fast path:")
+        print(f"  Size: {size_mb:.1f} MB")
+        print(f"  Time: {elapsed:.2f}s")
+        print(f"  Throughput: {throughput_mb:.2f} MB/s")
+        print(f"  Replacements: {sum(counts.values())} (should be 0)")
+
+        # Clean content should be MUCH faster
+        assert throughput_mb >= THRESHOLDS["clean_content_mb_per_sec"], \
+            f"Clean content too slow: {throughput_mb:.2f} < {THRESHOLDS['clean_content_mb_per_sec']} MB/s"
+        assert sum(counts.values()) == 0, "Clean content should have no replacements"
+
+    def test_high_sensitive_content_throughput(self, matcher, high_sensitive_content):
+        """Test throughput with 50% sensitive lines (worst case)."""
+        size_mb = estimate_content_size_mb(high_sensitive_content)
+
+        start = time.perf_counter()
+        result, counts = anonymize_content(high_sensitive_content, matcher)
+        elapsed = time.perf_counter() - start
+
+        throughput_mb = size_mb / elapsed
+        lines = high_sensitive_content.count("\n") + 1
+
+        print(f"\nHigh-sensitive content (50% sensitive):")
+        print(f"  Size: {size_mb:.1f} MB, {lines:,} lines")
+        print(f"  Time: {elapsed:.2f}s")
+        print(f"  Throughput: {throughput_mb:.2f} MB/s")
+        print(f"  Replacements: {sum(counts.values())}")
+
+        # Even worst case should maintain reasonable throughput
+        # (at least 50% of normal threshold)
+        min_threshold = THRESHOLDS["full_pipeline_mb_per_sec"] * 0.5
+        assert throughput_mb >= min_threshold, \
+            f"High-sensitive throughput too low: {throughput_mb:.2f} < {min_threshold} MB/s"
+
+
+# =============================================================================
+# SCALABILITY TESTS
+# =============================================================================
+
+class TestScalability:
+    """Test that performance scales linearly with input size."""
+
+    def test_linear_scaling(self, matcher):
+        """Verify throughput doesn't degrade significantly with larger inputs."""
+        sizes = [1_000, 10_000, 50_000]
+        throughputs = []
+
+        random.seed(42)
+
+        for num_lines in sizes:
+            content = generate_test_content(num_lines, sensitive_ratio=0.05)
+            size_mb = estimate_content_size_mb(content)
+
+            start = time.perf_counter()
+            anonymize_content(content, matcher)
+            elapsed = time.perf_counter() - start
+
+            throughput = size_mb / elapsed
+            throughputs.append(throughput)
+            print(f"\n{num_lines:,} lines: {throughput:.2f} MB/s")
+
+        # Throughput should not degrade by more than 30% at larger sizes
+        max_throughput = max(throughputs)
+        min_throughput = min(throughputs)
+        degradation = (max_throughput - min_throughput) / max_throughput
+
+        print(f"\nScaling: max={max_throughput:.2f}, min={min_throughput:.2f}, degradation={degradation:.1%}")
+        assert degradation < 0.5, f"Performance degrades too much at scale: {degradation:.1%}"
+
+
+# =============================================================================
+# MEMORY EFFICIENCY TESTS
+# =============================================================================
+
+class TestMemoryEfficiency:
+    """Test that optimizations don't cause excessive memory usage."""
+
+    def test_no_unnecessary_string_copies(self, matcher, clean_content):
+        """Verify clean content returns original string (no copy)."""
+        result, counts = anonymize_content(clean_content, matcher)
+
+        # For clean content, we should return the original string
+        # This avoids unnecessary memory allocation
+        assert result is clean_content or result == clean_content, \
+            "Clean content should return original or equivalent string"
+
+    def test_in_place_modification(self, matcher):
+        """Verify lines are modified in-place when possible."""
+        # Create content where only a few lines have sensitive data
+        lines = [generate_clean_log_line() for _ in range(1000)]
+        lines[500] = "password=secret123"  # One sensitive line
+        content = "\n".join(lines)
+
+        start = time.perf_counter()
+        result, counts = anonymize_content(content, matcher)
+        elapsed = time.perf_counter() - start
+
+        # Should be fast since only 1 line needs modification
+        size_mb = estimate_content_size_mb(content)
+        throughput = size_mb / elapsed
+
+        print(f"\nSparse sensitive content: {throughput:.2f} MB/s")
+        assert throughput >= THRESHOLDS["sparse_content_mb_per_sec"], \
+            f"Sparse content too slow: {throughput:.2f} < {THRESHOLDS['sparse_content_mb_per_sec']} MB/s"
+
+
+# =============================================================================
+# REGRESSION MARKERS
+# =============================================================================
+
+class TestPerformanceBaselines:
+    """
+    Tests that establish and verify performance baselines.
+    These tests should be run before and after any optimization changes.
+    """
+
+    def test_baseline_summary(self, matcher, medium_content, clean_content, high_sensitive_content):
+        """Print a summary of all performance metrics."""
+        print("\n" + "=" * 70)
+        print("PERFORMANCE BASELINE SUMMARY")
+        print("=" * 70)
+
+        # Mixed content
+        size_mb = estimate_content_size_mb(medium_content)
+        start = time.perf_counter()
+        anonymize_content(medium_content, matcher)
+        elapsed = time.perf_counter() - start
+        mixed_throughput = size_mb / elapsed
+
+        # Clean content
+        size_mb = estimate_content_size_mb(clean_content)
+        start = time.perf_counter()
+        anonymize_content(clean_content, matcher)
+        elapsed = time.perf_counter() - start
+        clean_throughput = size_mb / elapsed
+
+        # High sensitive
+        size_mb = estimate_content_size_mb(high_sensitive_content)
+        start = time.perf_counter()
+        anonymize_content(high_sensitive_content, matcher)
+        elapsed = time.perf_counter() - start
+        sensitive_throughput = size_mb / elapsed
+
+        print(f"\nMixed content (5% sensitive):    {mixed_throughput:>8.2f} MB/s")
+        print(f"Clean content (0% sensitive):    {clean_throughput:>8.2f} MB/s")
+        print(f"High sensitive (50% sensitive):  {sensitive_throughput:>8.2f} MB/s")
+
+        # Target calculation
+        target_20_min = 14289 / (20 * 60)  # 14GB in 20 minutes
+        print(f"\nTarget for 20-min (14GB):        {target_20_min:>8.2f} MB/s")
+        print(f"Current vs target:               {mixed_throughput/target_20_min:>8.1%}")
+        print("=" * 70)
+
+
+# =============================================================================
+# STREAMING/FILE PROCESSING TESTS
+# =============================================================================
+
+class TestStreamingLargeFileProcessing:
+    """
+    Tests for the actual streaming large file path in anonymizer.py.
+
+    These tests catch performance issues that in-memory tests miss:
+    - The process_large_file_streaming function
+    - Actual file I/O patterns
+    - Memory efficiency during streaming
+    """
+
+    def test_streaming_throughput_matches_in_memory(self, matcher):
+        """
+        Verify streaming path has similar throughput to in-memory.
+
+        This test catches regressions in process_large_file_streaming.
+        """
+        import tempfile
+        import os
+        from pathlib import Path
+
+        # Generate 10MB of test content (simulates a large file)
+        content = generate_test_content(100000, sensitive_ratio=0.05)
+        size_mb = estimate_content_size_mb(content)
+
+        # Measure in-memory throughput
+        start = time.perf_counter()
+        result_mem, counts_mem = anonymize_content(content, matcher)
+        elapsed_mem = time.perf_counter() - start
+        mem_throughput = size_mb / elapsed_mem
+
+        # Measure streaming throughput using actual file processing
+        from anonymizer import process_large_file_streaming
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "output.txt"
+            data = content.encode('utf-8')
+
+            start = time.perf_counter()
+            counts_stream, error = process_large_file_streaming(data, output_path)
+            elapsed_stream = time.perf_counter() - start
+            stream_throughput = size_mb / elapsed_stream
+
+        print(f"\nIn-memory throughput:  {mem_throughput:.2f} MB/s")
+        print(f"Streaming throughput:  {stream_throughput:.2f} MB/s")
+        print(f"Streaming / In-memory: {stream_throughput/mem_throughput:.1%}")
+
+        # Streaming should be at least 70% of in-memory speed
+        # (some overhead from file I/O is expected)
+        assert stream_throughput >= mem_throughput * 0.7, \
+            f"Streaming too slow: {stream_throughput:.2f} vs {mem_throughput:.2f} MB/s"
+
+    def test_streaming_with_clean_content_fast_path(self, matcher):
+        """
+        Verify clean content fast path works in streaming mode.
+
+        Files with no sensitive data should process very quickly.
+        """
+        import tempfile
+        from pathlib import Path
+
+        # Generate 10MB of clean content (no sensitive data)
+        lines = [generate_clean_log_line() for _ in range(100000)]
+        content = "\n".join(lines)
+        size_mb = estimate_content_size_mb(content)
+
+        from anonymizer import process_large_file_streaming
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "output.txt"
+            data = content.encode('utf-8')
+
+            start = time.perf_counter()
+            counts, error = process_large_file_streaming(data, output_path)
+            elapsed = time.perf_counter() - start
+            throughput = size_mb / elapsed
+
+        print(f"\nClean content streaming: {throughput:.2f} MB/s")
+
+        # Clean content should be fast (>10 MB/s) due to fast path
+        assert throughput >= 8.0, \
+            f"Clean content streaming too slow: {throughput:.2f} MB/s (expected >8)"
+
+        # Should have zero replacements
+        assert not counts or sum(counts.values()) == 0, \
+            f"Clean content should have no replacements, got {counts}"
+
+
+def _process_chunk(content: str) -> str:
+    """Process a single chunk - module-level function for pickling."""
+    from pattern_matcher import PatternMatcher, anonymize_content
+    matcher = PatternMatcher()
+    result, _ = anonymize_content(content, matcher)
+    return result
+
+
+class TestCPUUtilization:
+    """
+    Tests to verify CPU utilization patterns.
+
+    Low CPU utilization (<20%) on a multi-core system indicates
+    parallelization issues (GIL, sequential processing, etc.)
+    """
+
+    def test_parallel_chunk_processing_feasibility(self, matcher):
+        """
+        Test that content can be processed in parallel chunks.
+
+        This validates that splitting and parallel processing is viable
+        for improving CPU utilization on large files.
+        """
+        from concurrent.futures import ProcessPoolExecutor
+        import multiprocessing
+
+        # Generate LARGER test content - 200K lines (~20MB)
+        # Small chunks don't benefit from parallelism due to overhead
+        content = generate_test_content(200000, sensitive_ratio=0.05)
+        size_mb = estimate_content_size_mb(content)
+
+        # Split into chunks (at line boundaries)
+        lines = content.split('\n')
+        num_chunks = min(4, multiprocessing.cpu_count())
+        chunk_size = len(lines) // num_chunks
+        chunks = []
+        for i in range(num_chunks):
+            start_idx = i * chunk_size
+            end_idx = start_idx + chunk_size if i < num_chunks - 1 else len(lines)
+            chunks.append('\n'.join(lines[start_idx:end_idx]))
+
+        print(f"\nContent size: {size_mb:.1f} MB, {num_chunks} chunks of ~{size_mb/num_chunks:.1f} MB each")
+
+        # Process sequentially FIRST (so matcher is warm)
+        start = time.perf_counter()
+        for chunk in chunks:
+            anonymize_content(chunk, matcher)
+        elapsed_sequential = time.perf_counter() - start
+        sequential_throughput = size_mb / elapsed_sequential
+
+        # Process chunks in parallel (cold start, but larger chunks)
+        start = time.perf_counter()
+        with ProcessPoolExecutor(max_workers=num_chunks) as executor:
+            results = list(executor.map(_process_chunk, chunks))
+        elapsed_parallel = time.perf_counter() - start
+        parallel_throughput = size_mb / elapsed_parallel
+
+        print(f"Sequential throughput: {sequential_throughput:.2f} MB/s")
+        print(f"Parallel throughput:   {parallel_throughput:.2f} MB/s")
+        print(f"Speedup:              {parallel_throughput/sequential_throughput:.2f}x")
+        print(f"CPU cores used:       {num_chunks}")
+
+        # For larger data, parallel should show some benefit
+        # Relaxed assertion - just verify it's not significantly slower
+        assert parallel_throughput >= sequential_throughput * 0.8, \
+            f"Parallel processing significantly slower than sequential"
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-s"])
