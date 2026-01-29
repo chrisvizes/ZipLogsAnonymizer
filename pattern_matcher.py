@@ -127,7 +127,7 @@ class PatternMatcher:
         patterns.append(
             PatternConfig(
                 name="db_connection",
-                pattern=re.compile(r"jdbc:[a-zA-Z0-9]+://[^;\s]+"),
+                pattern=re.compile(r'jdbc:[a-zA-Z0-9]+://[^;\s"]+'),
                 replacement="DB_REDACTED",
                 uses_groups=False,
                 required_keywords=frozenset(["jdbc:"]),
@@ -139,9 +139,9 @@ class PatternMatcher:
             PatternConfig(
                 name="unc_path",
                 pattern=re.compile(
-                    r"\\\\[a-zA-Z0-9_.-]+\\[a-zA-Z0-9_.$-]+(?:\\[a-zA-Z0-9_.$-]+)*"
+                    r"\\{2,}[a-zA-Z0-9_.-]+\\{1,}[a-zA-Z0-9_.$-]+(?:\\{1,}[a-zA-Z0-9_.$-]+)*"
                 ),
-                replacement=r"\\\\REDACTED_SERVER\\REDACTED_SHARE",
+                replacement=r"\\\\REDACTED_SERVER\\\\REDACTED_SHARE",
                 uses_groups=False,
                 required_keywords=frozenset(["\\\\"]),
             )
@@ -223,7 +223,7 @@ class PatternMatcher:
             PatternConfig(
                 name="password",
                 pattern=re.compile(
-                    r'((?:password|passwd|pwd|secret)\s*[=:]\s*)[^\s,;\'"}\]]+|'
+                    r'((?:password|passwd|pwd|secret)\s*[=:]\s*)[^\s,;\\\'"}\]]+|'
                     r'("(?:password|passwd|pwd|secret)"\s*:\s*")[^"]+',
                     re.IGNORECASE,
                 ),
@@ -242,7 +242,7 @@ class PatternMatcher:
                     r'("(?:api[_-]?key|token)"\s*:\s*")[^"]{20,}',
                     re.IGNORECASE,
                 ),
-                replacement="API_KEY_REDACTED",
+                replacement=r"\1API_KEY_REDACTED",
                 uses_groups=True,
                 required_keywords=frozenset(
                     ["api_key", "api-key", "apikey", "token", "bearer"]
@@ -255,7 +255,7 @@ class PatternMatcher:
             PatternConfig(
                 name="db_connection",
                 pattern=re.compile(
-                    r"(?:Server|Data Source|User ID|uid)\s*=\s*[^;\s]+",
+                    r'\b(?:Server|Data Source|User ID|uid)\s*=\s*[^;\s"]+',
                     re.IGNORECASE,
                 ),
                 replacement="DB_REDACTED",
@@ -286,7 +286,7 @@ class PatternMatcher:
             PatternConfig(
                 name="tableau_entity",
                 pattern=re.compile(
-                    r'((?:site|workbook|datasource|project)\s*[=:]\s*)([^\s,;\'"}\]]+)',
+                    r'((?:site|workbook|datasource|project)\s*[=:]\s*)([^\s,;\\\'"}\]]+)',
                     re.IGNORECASE,
                 ),
                 replacement=r"\1{UNIQUE}",
@@ -384,7 +384,14 @@ class FastAnonymizer:
                 original = m.group(0)
                 self.counts[config.name] += 1
                 if config.uses_groups and m.lastindex:
-                    prefix = m.group(1) or ""
+                    # Find the first non-None group (handles alternation patterns
+                    # where different alternatives use different group numbers)
+                    prefix = ""
+                    for i in range(1, m.lastindex + 1):
+                        grp = m.group(i)
+                        if grp is not None:
+                            prefix = grp
+                            break
                     return prefix + self.get_unique_replacement(
                         config.name, original, config.replacement.replace(r"\1", "")
                     )
@@ -395,10 +402,13 @@ class FastAnonymizer:
             def replacer(m):
                 self.counts[config.name] += 1
                 result = config.replacement
+                # Find the first non-None group and substitute it for \1
+                # (handles alternation patterns where the prefix may be
+                # in group 1, 3, 5, etc. depending on which alternative matched)
                 for i in range(1, (m.lastindex or 0) + 1):
                     grp = m.group(i)
-                    if grp:
-                        result = result.replace(f"\\{i}", grp)
+                    if grp is not None:
+                        result = result.replace(r"\1", grp)
                         break
                 return result
             return config.pattern.sub(replacer, text)
@@ -410,9 +420,13 @@ class FastAnonymizer:
                 self.counts[config.name] += count
             return new_text
 
-    def process_content(self, content: str) -> tuple[str, dict[str, int]]:
+    def process_content(self, content: str, full_reset: bool = True) -> tuple[str, dict[str, int]]:
         """Process content with all optimizations."""
-        self.reset()
+        if full_reset:
+            self.reset()
+        else:
+            # Reset counts only, preserve unique_counters for consistency across chunks
+            self.counts = defaultdict(int)
 
         # OPTIMIZATION: Lowercase entire content ONCE (not per-line)
         content_lower = content.lower()
@@ -551,6 +565,10 @@ def anonymize_content_chunked(
     if len(content) <= chunk_size:
         return anonymize_content(content, matcher)
 
+    anonymizer = get_fast_anonymizer(matcher)
+    # Full reset once at the start so unique_counters persist across chunks
+    anonymizer.reset()
+
     counts: dict[str, int] = defaultdict(int)
     result_parts = []
 
@@ -565,7 +583,7 @@ def anonymize_content_chunked(
 
         if current_size >= chunk_size:
             chunk_content = "\n".join(current_chunk)
-            chunk_result, chunk_counts = anonymize_content(chunk_content, matcher)
+            chunk_result, chunk_counts = anonymizer.process_content(chunk_content, full_reset=False)
             result_parts.append(chunk_result)
 
             for cat, count in chunk_counts.items():
@@ -577,7 +595,7 @@ def anonymize_content_chunked(
     # Process remaining
     if current_chunk:
         chunk_content = "\n".join(current_chunk)
-        chunk_result, chunk_counts = anonymize_content(chunk_content, matcher)
+        chunk_result, chunk_counts = anonymizer.process_content(chunk_content, full_reset=False)
         result_parts.append(chunk_result)
 
         for cat, count in chunk_counts.items():

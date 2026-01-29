@@ -982,5 +982,107 @@ class TestFormatTime:
         assert format_time(36000) == "10h 0m 0s"
 
 
+class TestJSONStructurePreservation:
+    """Regression tests for JSON-breaking bugs in pattern replacements."""
+
+    def test_username_json_alternation_preserves_structure(self, matcher):
+        """Username pattern with JSON format must preserve key and quotes."""
+        content = '{"site":"-","user":"johnsmith","k":"test"}'
+        result, counts = anonymize_content(content, matcher)
+        import json
+        parsed = json.loads(result)
+        assert "user" in parsed
+        assert counts["username"] == 1
+
+    def test_password_json_alternation_preserves_structure(self, matcher):
+        """Password pattern with JSON format must preserve key and quotes."""
+        content = '{"password":"mysecret","port":"80"}'
+        result, counts = anonymize_content(content, matcher)
+        import json
+        parsed = json.loads(result)
+        assert "password" in parsed
+        assert parsed["password"] == "PASSWORD_REDACTED"
+
+    def test_api_key_replacement_preserves_prefix(self, matcher):
+        """API key replacement must keep the key name."""
+        content = "api_key=abcdefghijklmnopqrstuvwxyz"
+        result, counts = anonymize_content(content, matcher)
+        assert result.startswith("api_key=")
+        assert counts["api_key"] == 1
+
+    def test_api_key_json_preserves_structure(self, matcher):
+        """API key in JSON must preserve key and quotes."""
+        content = '{"token":"abcdefghijklmnopqrstuvwxyz"}'
+        result, counts = anonymize_content(content, matcher)
+        import json
+        parsed = json.loads(result)
+        assert "token" in parsed
+
+    def test_jdbc_in_json_preserves_closing_quote(self, matcher):
+        """JDBC pattern must not consume past JSON string delimiter."""
+        content = '{"url":"jdbc:postgresql://host:5432/db","next":"val"}'
+        result, counts = anonymize_content(content, matcher)
+        import json
+        parsed = json.loads(result)
+        assert "next" in parsed
+        assert parsed["next"] == "val"
+
+    def test_db_connection_uid_word_boundary(self, matcher):
+        """uid must not match inside compound words like lens-luid."""
+        content = r'{"v":"lens-luid=\"6905\" site-id=\"4\""}'
+        result, _ = anonymize_content(content, matcher)
+        assert "DB_REDACTED" not in result
+        import json
+        json.loads(result)  # must be valid JSON
+
+    def test_db_connection_standalone_uid(self, matcher):
+        """Standalone uid= must still be matched."""
+        content = "uid=admin;password=secret"
+        result, counts = anonymize_content(content, matcher)
+        assert "DB_REDACTED" in result
+        assert counts["db_connection"] == 1
+
+    def test_unc_path_json_valid_escaping(self, matcher):
+        """UNC path replacement must produce valid JSON escape sequences."""
+        content = r'{"v":"path \\\\server\\share end"}'
+        result, _ = anonymize_content(content, matcher)
+        import json
+        json.loads(result)  # must not raise
+
+    def test_unc_path_consumes_all_leading_backslashes(self, matcher):
+        """UNC pattern must consume all leading backslashes to avoid orphans."""
+        # 3 raw backslashes before server name
+        content = "prefix \\\\\\server\\share suffix"
+        result, counts = anonymize_content(content, matcher)
+        assert "server" not in result
+        assert counts["unc_path"] == 1
+
+    def test_password_escaped_quotes_no_stray_chars(self, matcher):
+        """Password with escaped quotes must not leave stray characters."""
+        content = r'{"v":"password=\"secret\" port=\"80\""}'
+        result, _ = anonymize_content(content, matcher)
+        import json
+        json.loads(result)  # must be valid JSON
+
+    def test_tableau_entity_escaped_quotes_no_stray_chars(self, matcher):
+        """Tableau entity with escaped quotes must not break JSON structure."""
+        content = r'{"v":"datasource=\"MyDS\" is-summary=\"true\""}'
+        result, _ = anonymize_content(content, matcher)
+        import json
+        json.loads(result)  # must be valid JSON (no stray quotes from broken match)
+
+    def test_chunked_unique_id_consistency(self, matcher):
+        """Same value across chunks must get the same unique ID."""
+        from pattern_matcher import anonymize_content_chunked
+        # Create content with same email in two chunks
+        lines = ["Contact user@example.com"] * 5 + [""] * 100 + ["Again user@example.com"] * 5
+        content = "\n".join(lines)
+        result, _ = anonymize_content_chunked(content, matcher, chunk_size=200)
+        # All replacements of the same email should use the same ID
+        import re
+        ids = re.findall(r"[a-z]+\d+@redacted\.com", result)
+        assert len(set(ids)) == 1
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
