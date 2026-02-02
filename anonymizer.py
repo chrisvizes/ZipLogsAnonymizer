@@ -1058,13 +1058,31 @@ def process_zip(
             output_zip_path = zip_path.parent / (zip_path.stem + "_anonymized.zip")
             notify_progress({"type": "creating_zip"})
             print(f"\nCreating output zip file...")
-            with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for file_path in output_dir.rglob('*'):
-                    if file_path.is_file():
-                        arcname = file_path.relative_to(output_dir)
+
+            # Count files for progress
+            all_files = list(output_dir.rglob('*'))
+            files_to_zip = [f for f in all_files if f.is_file()]
+            total_files_to_zip = len(files_to_zip)
+
+            zip_start = time.time()
+            with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+                for i, file_path in enumerate(files_to_zip):
+                    arcname = file_path.relative_to(output_dir)
+                    # Use STORED (no compression) for already-compressed formats
+                    ext = file_path.suffix.lower()
+                    if ext in {'.zip', '.gz', '.bz2', '.xz', '.7z', '.rar', '.jpg', '.jpeg', '.png', '.gif', '.mp4', '.avi', '.pdf'}:
+                        zf.write(file_path, arcname, compress_type=zipfile.ZIP_STORED)
+                    else:
                         zf.write(file_path, arcname)
+
+                    # Progress update every 10 files or so
+                    if (i + 1) % 10 == 0 or i + 1 == total_files_to_zip:
+                        pct = (i + 1) * 100 // total_files_to_zip
+                        print(f"\r  Zipping: {pct}% ({i + 1}/{total_files_to_zip} files)", end="", flush=True)
+
+            zip_elapsed = time.time() - zip_start
             zip_size_mb = output_zip_path.stat().st_size / 1024 / 1024
-            print(f"Created: {output_zip_path.name} ({zip_size_mb:.1f} MB)")
+            print(f"\nCreated: {output_zip_path.name} ({zip_size_mb:.1f} MB) in {zip_elapsed:.1f}s")
 
         # Remove uncompressed directory if not keeping it
         if create_zip and not keep_uncompressed:
