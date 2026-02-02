@@ -360,6 +360,9 @@ function clearTreemap() {
  * Show the complete overlay
  */
 function showCompleteOverlay() {
+    // Hide any visible tooltip first
+    hideTooltip();
+
     const overlay = document.getElementById('complete-overlay');
     const container = document.getElementById('treemap-container');
     if (overlay) {
@@ -585,6 +588,7 @@ function processingComplete(success, outputPath, outputZipPath) {
     stopCountdown();
     isProcessing = false;
     hideStatusSpinner();
+    hideTooltip();
 
     // Remove processing class
     const container = document.getElementById('treemap-container');
