@@ -202,11 +202,15 @@ def build(pure_python: bool = False):
         f"pattern_matcher.py{separator}.",  # Include pattern_matcher module
         "--add-data",
         f"anonymizer.py{separator}.",  # Include anonymizer module
+        "--add-data",
+        f"gui_assets{separator}gui_assets",  # Include GUI assets folder
         # Hidden imports that PyInstaller might miss
         "--hidden-import",
         "pattern_matcher",
         "--hidden-import",
         "anonymizer",
+        "--hidden-import",
+        "webview",
     ]
 
     # Add Rust binaries if available

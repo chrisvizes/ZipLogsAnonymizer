@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ZipLogsAnonymizer</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+</head>
+<body>
+    <!-- Header Section -->
+    <header class="app-header">
+        <div class="header-left">
+            <h1>ZipLogsAnonymizer</h1>
+            <p class="subtitle">Anonymize sensitive data in log archives for safe sharing</p>
+        </div>
+    </header>
+
+    <!-- File Selection Section -->
+    <section class="file-section">
+        <div class="file-input-group">
+            <input type="text" id="file-path" readonly placeholder="Select a zip file...">
+            <button id="browse-btn" onclick="pywebview.api.browse_file()">Browse...</button>
+        </div>
+        <div class="file-hint">
+            Text formats processed: .log, .txt, .json, .xml, .yml, .yaml, .properties, .conf, .config, .html, .htm
+        </div>
+    </section>
+
+    <!-- Options Section -->
+    <section class="options-section">
+        <label class="checkbox-label">
+            <input type="checkbox" id="create-zip" checked>
+            <span>Output as a zip file</span>
+        </label>
+        <label class="checkbox-label">
+            <input type="checkbox" id="keep-uncompressed" checked>
+            <span>Output uncompressed folder (for browsing/searching)</span>
+        </label>
+    </section>
+
+    <!-- Stats Bar -->
+    <section class="stats-bar">
+        <div class="stat-item">
+            <span class="stat-label">Progress</span>
+            <span class="stat-value" id="stat-progress">--</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">Total Size</span>
+            <span class="stat-value" id="stat-total-size">--</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">Throughput</span>
+            <span class="stat-value throughput" id="stat-throughput">--</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">Time Remaining</span>
+            <span class="stat-value eta" id="stat-eta">--</span>
+        </div>
+    </section>
+
+    <!-- Treemap Container -->
+    <section class="treemap-section">
+        <div id="treemap-container">
+            <div class="treemap-placeholder">
+                <p>Select a zip file to visualize processing progress</p>
+            </div>
+            <!-- Complete Overlay -->
+            <div id="complete-overlay" class="complete-overlay">
+                <span class="complete-text">Complete</span>
+            </div>
+        </div>
+        <!-- Tooltip -->
+        <div id="tooltip" class="tooltip"></div>
+    </section>
+
+    <!-- Output Info (shown after completion) -->
+    <section id="output-info" class="output-info hidden">
+        <div class="output-info-content">
+            <span class="output-label">Output:</span>
+            <span id="output-path" class="output-path" title="Click to open folder"></span>
+            <button class="btn-open-folder" onclick="pywebview.api.open_output_folder()" title="Open in Explorer">
+                <span class="folder-icon">&#128193;</span>
+            </button>
+        </div>
+    </section>
+
+    <!-- Action Buttons -->
+    <section class="actions-section">
+        <button id="process-btn" class="btn-primary" disabled onclick="pywebview.api.start_processing()">
+            Anonymize
+        </button>
+        <button id="cancel-btn" class="btn-secondary" disabled onclick="pywebview.api.cancel_processing()">
+            Cancel
+        </button>
+        <button id="open-folder-btn" class="btn-secondary" disabled onclick="pywebview.api.open_output_folder()">
+            Open Output Folder
+        </button>
+    </section>
+
+    <!-- Status Bar -->
+    <footer class="status-bar">
+        <span id="status-text">Select a zip file to begin</span>
+        <span id="status-spinner" class="status-spinner hidden"></span>
+    </footer>
+
+    <script src="treemap.js"></script>
+</body>
+</html>

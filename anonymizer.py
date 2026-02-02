@@ -776,6 +776,7 @@ def process_zip(
     zip_path: str,
     max_workers: Optional[int] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
     create_zip: bool = True,
     keep_uncompressed: bool = True,
 ) -> bool:
@@ -791,6 +792,9 @@ def process_zip(
         zip_path: Path to the zip file to process
         max_workers: Number of parallel workers (default: CPU count, max 8)
         cancel_check: Optional callback that returns True if processing should be cancelled
+        progress_callback: Optional callback for GUI progress updates, receives event dicts:
+            - {"type": "file_status", "name": filename, "status": "queued"|"in_progress"|"done"}
+            - {"type": "stats", "progress_pct": float, "throughput_mbs": float, "eta_seconds": float}
         create_zip: Create a zip file from the output (default: True, for LogShark compatibility)
         keep_uncompressed: Keep the uncompressed directory (default: True)
     """
@@ -800,6 +804,14 @@ def process_zip(
         """Check if cancellation was requested and raise if so."""
         if cancel_check and cancel_check():
             raise CancelledException("Processing cancelled by user")
+
+    def notify_progress(event: dict):
+        """Send progress event to callback if available."""
+        if progress_callback:
+            try:
+                progress_callback(event)
+            except Exception:
+                pass  # Don't let callback errors break processing
 
     start_time = time.time()
     zip_path = Path(zip_path)
@@ -858,6 +870,7 @@ def process_zip(
             # Silent copy - no progress bar needed for binary files
             if binary_entries:
                 check_cancelled()
+                notify_progress({"type": "file_status", "name": "binary_files", "status": "in_progress"})
                 for entry in binary_entries:
                     check_cancelled()
                     data = src_zip.read(entry.filename)
@@ -865,6 +878,7 @@ def process_zip(
                     out_path.parent.mkdir(parents=True, exist_ok=True)
                     out_path.write_bytes(data)
                 print(f"Copied {len(binary_entries)} binary files")
+                notify_progress({"type": "file_status", "name": "binary_files", "status": "done"})
 
             # Phase 2: Process text files with memory-efficient streaming
             if text_entries:
@@ -899,6 +913,7 @@ def process_zip(
                     def process_large_file(entry):
                         """Process a single large file (runs in thread)."""
                         large_progress.start_file(entry.filename, entry.file_size)
+                        notify_progress({"type": "file_status", "name": entry.filename, "status": "in_progress"})
                         data = src_zip.read(entry.filename)
 
                         out_path = output_dir / entry.filename
@@ -927,6 +942,16 @@ def process_zip(
                             del result
 
                         large_progress.finish_file(entry.filename, file_replacements)
+
+                        # Notify GUI of completion and stats
+                        notify_progress({"type": "file_status", "name": entry.filename, "status": "done"})
+                        notify_progress({
+                            "type": "stats",
+                            "progress_pct": (large_progress.completed_mb / large_progress.total_size_mb * 100) if large_progress.total_size_mb > 0 else 0,
+                            "throughput_mbs": large_progress.get_average_throughput(),
+                            "eta_seconds": large_progress.get_eta_seconds(),
+                            "total_mb": large_progress.total_size_mb
+                        })
 
                         # Free memory
                         del data
@@ -959,6 +984,7 @@ def process_zip(
                 # Process small files in parallel with limited concurrency
                 if small_files:
                     check_cancelled()
+                    notify_progress({"type": "file_status", "name": "small_files", "status": "in_progress"})
                     # Don't show ETA for small files - it's misleading early on
                     progress = ProgressBar(
                         len(small_files), "Small files  ", show_eta=False
@@ -1021,6 +1047,7 @@ def process_zip(
                             pass
 
                     progress.finish()
+                    notify_progress({"type": "file_status", "name": "small_files", "status": "done"})
 
         # Calculate timing
         elapsed = time.time() - start_time
@@ -1029,6 +1056,7 @@ def process_zip(
         output_zip_path = None
         if create_zip:
             output_zip_path = zip_path.parent / (zip_path.stem + "_anonymized.zip")
+            notify_progress({"type": "creating_zip"})
             print(f"\nCreating output zip file...")
             with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                 for file_path in output_dir.rglob('*'):

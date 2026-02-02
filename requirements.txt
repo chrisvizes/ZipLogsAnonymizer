@@ -1,5 +1,5 @@
-# Runtime dependencies (none - uses only standard library)
-# All imports (re, tkinter, multiprocessing, etc.) are part of Python's standard library
+# Runtime dependencies
+pywebview>=5.0.0     # For the GUI (lightweight embedded browser)
 
 # Development/Build dependencies
 pytest>=7.0.0        # For running tests
