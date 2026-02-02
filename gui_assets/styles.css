@@ -121,15 +121,7 @@ body {
 .stat-value {
     font-size: 1.2rem;
     font-weight: 600;
-    color: #cc6600;
-}
-
-.stat-value.throughput {
-    color: #0066cc;
-}
-
-.stat-value.eta {
-    color: #009933;
+    color: #1e1e1e;
 }
 
 /* Treemap Section */
