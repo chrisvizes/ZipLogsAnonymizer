@@ -53,8 +53,8 @@ if not _is_worker_process():
         def __init__(self, root):
             self.root = root
             self.root.title("ZipLogsAnonymizer")
-            self.root.geometry("700x500")
-            self.root.minsize(600, 400)
+            self.root.geometry("800x650")
+            self.root.minsize(700, 550)
 
             # Message queue for thread-safe UI updates
             self.message_queue = queue.Queue()
@@ -63,6 +63,12 @@ if not _is_worker_process():
             self.processing = False
             self.output_dir = None
             self.cancel_requested = False
+
+            # Track MB-based progress
+            self.total_mb = 0.0
+            self.completed_mb = 0.0
+            self.large_files_total_mb = 0.0
+            self.small_files_total_mb = 0.0
 
             self._create_widgets()
             self._setup_output_redirect()
@@ -228,7 +234,7 @@ if not _is_worker_process():
                 output_frame,
                 wrap=tk.WORD,
                 font=("Consolas", 9),
-                height=12,
+                height=18,  # Show ~18 lines for better visibility
                 state="disabled",
             )
             self.output_text.grid(row=0, column=0, sticky="nsew")
@@ -297,14 +303,39 @@ if not _is_worker_process():
                     # Parse total uncompressed size from large file header
                     # Format: "Processing X large file(s) (XXX.X MB total)"
                     total_size_match = re.search(
-                        r"\((\d+(?:\.\d+)?)\s*MB total\)", message
+                        r"Processing\s+\d+\s+large.*\((\d+(?:\.\d+)?)\s*MB total\)",
+                        message,
                     )
                     if total_size_match:
-                        size_mb = float(total_size_match.group(1))
-                        if size_mb >= 1000:
-                            self.total_size_var.set(f"{size_mb/1024:.2f} GB")
+                        self.large_files_total_mb = float(total_size_match.group(1))
+                        self.total_mb = (
+                            self.large_files_total_mb + self.small_files_total_mb
+                        )
+                        self.completed_mb = (
+                            0.0  # Reset completed when starting large files
+                        )
+                        # Update total size display
+                        if self.total_mb >= 1000:
+                            self.total_size_var.set(f"{self.total_mb/1024:.2f} GB")
                         else:
-                            self.total_size_var.set(f"{size_mb:.1f} MB")
+                            self.total_size_var.set(f"{self.total_mb:.1f} MB")
+                        # Show initial progress
+                        self.progress_var.set("0%")
+
+                    # Parse completed MB from large file DONE messages
+                    # Format: "DONE [X/Y]: filename (123.3 MB @ 4.94 MB/s, 17361 repl)"
+                    done_match = re.search(
+                        r"DONE\s+\[\d+/\d+\]:.*?\((\d+(?:\.\d+)?)\s*MB\s*@", message
+                    )
+                    if done_match:
+                        file_mb = float(done_match.group(1))
+                        self.completed_mb += file_mb
+                        # Calculate percentage based on MB
+                        if self.large_files_total_mb > 0:
+                            pct = int(
+                                self.completed_mb * 100 / self.large_files_total_mb
+                            )
+                            self.progress_var.set(f"{pct}%")
 
                     # Parse throughput and ETA from large file progress output
                     # Format: "Avg: X.XX MB/s | ETA: Xm Xs"
@@ -319,6 +350,10 @@ if not _is_worker_process():
                     if eta_match:
                         self.eta_var.set(eta_match.group(1).strip())
 
+                    # Detect large files completion
+                    if "Large files completed" in message:
+                        self.progress_var.set("100%")
+
                     # Detect completion - clear time remaining
                     if "ANONYMIZATION COMPLETE" in message:
                         self.eta_var.set("Complete!")
@@ -326,21 +361,10 @@ if not _is_worker_process():
 
                     # Parse progress from small files progress bar
                     # Format: "[====----] 50% (100/200)"
-                    progress_match = re.search(r"(\d+)%\s*\((\d+)/(\d+)\)", message)
+                    progress_match = re.search(r"Small files.*?(\d+)%", message)
                     if progress_match:
                         pct = progress_match.group(1)
-                        current = progress_match.group(2)
-                        total = progress_match.group(3)
-                        self.progress_var.set(f"{pct}% ({current}/{total})")
-
-                    # Parse large file progress
-                    # Format: "[X/Y]" for completed files
-                    large_progress_match = re.search(r"\[(\d+)/(\d+)\].*DONE", message)
-                    if large_progress_match:
-                        current = int(large_progress_match.group(1))
-                        total = int(large_progress_match.group(2))
-                        pct = int(current * 100 / total) if total > 0 else 0
-                        self.progress_var.set(f"{pct}% ({current}/{total} files)")
+                        self.progress_var.set(f"{pct}%")
 
             except queue.Empty:
                 pass
@@ -402,6 +426,12 @@ if not _is_worker_process():
             self.throughput_var.set("--")
             self.eta_var.set("--")
             self.progress_var.set("--")
+
+            # Reset MB tracking
+            self.total_mb = 0.0
+            self.completed_mb = 0.0
+            self.large_files_total_mb = 0.0
+            self.small_files_total_mb = 0.0
 
             # Calculate expected output directory
             zip_file = Path(zip_path)

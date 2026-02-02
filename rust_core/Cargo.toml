@@ -1,0 +1,22 @@
+[package]
+name = "anonymizer_core"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance anonymization core for ZipLogsAnonymizer"
+
+[lib]
+name = "anonymizer_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.21", features = ["extension-module"] }
+regex = "1.10"
+aho-corasick = "1.1"
+rayon = "1.10"
+once_cell = "1.19"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true

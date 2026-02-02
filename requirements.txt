@@ -4,3 +4,7 @@
 # Development/Build dependencies
 pytest>=7.0.0        # For running tests
 pyinstaller>=6.0.0   # For building standalone executable
+
+# Optional: Rust acceleration (for 300+ MB/s throughput)
+# Requires Rust toolchain: https://rustup.rs/
+maturin>=1.0.0       # For building Rust extension
