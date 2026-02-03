@@ -66,11 +66,11 @@ The following sensitive data patterns are detected and replaced:
 
 ### Personal Information
 
-| Data Type       | Detection Method                                  | Example                | Replacement               |
-| --------------- | ------------------------------------------------- | ---------------------- | ------------------------- |
-| Email Addresses | Standard email regex                              | `john.doe@company.com` | `user001@redacted.com`    |
-| Usernames       | Context keywords (`user=`, `username:`, `login=`) | `user=jsmith`          | `user=user001`            |
-| SSNs            | Format `###-##-####`                              | `123-45-6789`          | `SSN_REDACTED`            |
+| Data Type       | Detection Method                                  | Example                | Replacement            |
+| --------------- | ------------------------------------------------- | ---------------------- | ---------------------- |
+| Email Addresses | Standard email regex                              | `john.doe@company.com` | `user001@redacted.com` |
+| Usernames       | Context keywords (`user=`, `username:`, `login=`) | `user=jsmith`          | `user=user001`         |
+| SSNs            | Format `###-##-####`                              | `123-45-6789`          | `SSN_REDACTED`         |
 
 ### Network & Infrastructure
 
@@ -84,12 +84,12 @@ The following sensitive data patterns are detected and replaced:
 
 ### Tableau-Specific
 
-| Data Type        | Detection Method      | Example                   | Replacement               |
-| ---------------- | --------------------- | ------------------------- | ------------------------- |
-| Site Names       | `site=` context       | `site=CustomerPortal`     | `site=entity001`          |
-| Workbook Names   | `workbook=` context   | `workbook=SalesReport`    | `workbook=entity002`      |
-| Datasource Names | `datasource=` context | `datasource=ProductionDB` | `datasource=entity003`    |
-| Project Names    | `project=` context    | `project=Finance`         | `project=entity004`       |
+| Data Type        | Detection Method      | Example                   | Replacement            |
+| ---------------- | --------------------- | ------------------------- | ---------------------- |
+| Site Names       | `site=` context       | `site=CustomerPortal`     | `site=entity001`       |
+| Workbook Names   | `workbook=` context   | `workbook=SalesReport`    | `workbook=entity002`   |
+| Datasource Names | `datasource=` context | `datasource=ProductionDB` | `datasource=entity003` |
+| Project Names    | `project=` context    | `project=Finance`         | `project=entity004`    |
 
 ### Consistency Guarantee
 
@@ -132,49 +132,56 @@ The following are **intentionally not modified** and may still contain sensitive
 └─────────────┘     └──────────────┘     └─────────────┘     └──────────────┘     └──────────────┘
                            │                    │
                            ▼                    ▼
-                    Binary files         Text files scanned
-                    copied as-is         for sensitive patterns
+                    Binary files         Text files processed
+                    copied as-is         by Rust core engine
 ```
 
-1. **File Categorization**: Files are sorted into text (`.log`, `.txt`, `.json`, `.xml`, `.yml`, `.yaml`, `.properties`, `.conf`, `.config`, `.html`) and binary (everything else)
+1. **File Categorization**: Files are sorted into text (`.log`, `.txt`, `.json`, `.xml`, `.yml`, `.yaml`, `.properties`, `.conf`, `.config`, `.html`, `.htm`) and binary (everything else)
 
 2. **Binary Passthrough**: Binary files (images, compiled files, etc.) are copied unchanged
 
-3. **Text Processing**: Each text file is scanned line-by-line for sensitive patterns using optimized regex matching
+3. **Text Processing**: Text files are processed by a high-performance Rust core that applies regex patterns to detect and replace sensitive data
 
-4. **Immediate Write**: Processed files are written to disk immediately (not held in memory)
+4. **Memory-Efficient Streaming**: Large files (>5MB) are processed in chunks to keep memory usage bounded, writing output directly to disk
 
-5. **Cleanup on Failure**: If processing fails partway through, the incomplete output directory is deleted to prevent accidental use of partially-anonymized data
+5. **Cleanup on Failure**: If processing fails or is cancelled, the incomplete output directory is deleted to prevent accidental use of partially-anonymized data
 
-### Performance Optimizations
+### Performance
 
-The tool is designed to handle large log archives (1-2GB+ zips containing thousands of files). Real-world benchmark on a 1.8GB zip (14.3GB uncompressed): **~11 MB/s throughput, completed in under 30 minutes**.
+The tool is designed to handle large log archives (1-2GB+ zips containing thousands of files). The Rust core provides **5-15x faster processing** compared to pure Python regex.
 
-| Challenge | Solution |
-| --- | --- |
-| **Memory usage** | Memory-aware concurrency - automatically limits parallel processing based on available RAM. Large files processed with streaming to avoid memory spikes. |
-| **Large files (>10MB)** | Parallel chunk processing using ProcessPoolExecutor to bypass Python's GIL. Files split into chunks and processed across multiple CPU cores. |
-| **Small files** | Processed in parallel across multiple CPU cores using ProcessPoolExecutor (up to 16 concurrent). |
-| **Regex performance** | Batch keyword pre-screening - scans entire content once to find which keywords are present, then only checks those keywords per-line. |
-| **Pattern matching** | Line-by-line processing with early exit - each line only runs against patterns whose keywords appear in that line. Typically reduces checks from ~25 to 1-3 patterns per line. |
+| Technique                    | Description                                                                                                                                                       |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Rust Core**                | Pattern matching implemented in Rust via PyO3 for maximum throughput. All regex operations run in compiled native code.                                           |
+| **Memory-Aware Concurrency** | Automatically limits parallel processing based on available RAM. Large files use streaming to avoid memory spikes.                                                |
+| **Parallel Processing**      | Small files processed in parallel using ProcessPoolExecutor. Large files use ThreadPoolExecutor with chunked processing.                                          |
+| **Keyword Pre-Filtering**    | Scans content once to identify which patterns could match, then only applies relevant patterns per-line. Typically reduces regex checks from ~25 to 1-3 per line. |
+| **Optimized Compression**    | Output zip uses fast compression (level 1) and stores already-compressed files without re-compression.                                                            |
 
 ### Architecture
 
 ```text
 ZipLogsAnonymizer/
-├── gui.py               # GUI application (tkinter) - user interface
+├── gui.py               # GUI application (pywebview + D3.js treemap)
 ├── anonymizer.py        # Main processing logic - file handling, parallelization
-├── pattern_matcher.py   # Pattern definitions and matching logic
+├── pattern_matcher.py   # Pattern definitions and Python/Rust interface
+├── gui_assets/          # Web-based GUI resources
+│   ├── index.html       # Main GUI layout
+│   ├── styles.css       # Styling
+│   └── treemap.js       # D3.js treemap visualization
+├── rust_core/           # Rust extension (anonymizer_core)
+│   ├── src/lib.rs       # Rust pattern matching implementation
+│   └── Cargo.toml       # Rust dependencies
 ├── test_anonymizer.py   # Test suite - pattern matching and edge cases
 ├── test_performance.py  # Performance tests - throughput, memory, consistency
-├── benchmark.py         # Benchmark script for real-world testing
 ├── build.py             # Build script for creating executable
 └── requirements.txt     # Python dependencies
 ```
 
-- **`pattern_matcher.py`**: Defines all sensitive data patterns with their regex, replacement text, and required keywords for pre-filtering. Uses natural-looking replacements (e.g., `user001` instead of `USERNAME_001`) for compatibility with log analysis tools like LogShark.
-- **`anonymizer.py`**: Handles zip extraction, file categorization, parallel processing (using ProcessPoolExecutor for CPU-bound work), progress display, and output writing. Creates both uncompressed directory and zip file output.
-- **`gui.py`**: Provides the graphical interface with real-time throughput, time remaining, and progress tracking.
+- **`rust_core/`**: High-performance Rust extension built with PyO3 and maturin. Implements all regex pattern matching for 5-15x speedup over Python.
+- **`pattern_matcher.py`**: Defines sensitive data patterns and provides the Python interface to the Rust core. Uses natural-looking replacements (e.g., `user001` instead of `USERNAME_001`) for compatibility with log analysis tools.
+- **`anonymizer.py`**: Handles zip extraction, file categorization, parallel processing, progress reporting, and output writing. Creates both uncompressed directory and zip file output.
+- **`gui.py`**: Provides the graphical interface using pywebview with a D3.js treemap visualization showing real-time processing progress for each file.
 
 ---
 
@@ -187,16 +194,31 @@ ZipLogsAnonymizer/
 git clone <repo-url>
 cd ZipLogsAnonymizer
 
-# Install development dependencies
+# Install Python dependencies
 pip install -r requirements.txt
+
+# Install Rust toolchain (required)
+# Visit https://rustup.rs/ or run:
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Build the Rust extension
+cd rust_core
+maturin develop --release
+cd ..
 ```
+
+The Rust extension (`anonymizer_core`) is required. The application will fail to start without it.
 
 ### Running Tests
 
-The project includes 105 tests covering pattern matching, edge cases, and output integrity:
+The project includes functional tests and performance tests:
 
 ```bash
+# Run all functional tests
 pytest test_anonymizer.py -v
+
+# Run performance tests
+pytest test_performance.py -v
 ```
 
 ### Adding New Patterns
@@ -246,7 +268,7 @@ pip install pyinstaller
 python build.py
 ```
 
-This creates `dist/ZipLogsAnonymizer.exe` (~11MB) that runs without Python installed.
+This creates `dist/ZipLogsAnonymizer.exe` that runs without Python installed.
 
 #### Mac / Linux
 
