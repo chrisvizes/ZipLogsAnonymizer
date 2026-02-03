@@ -66,80 +66,6 @@ LARGE_FILE_THRESHOLD = (
 MEMORY_SAFETY_FACTOR = 2.0  # Assume each file needs ~2x its size in memory (read + output buffer)
 MIN_FREE_MEMORY_MB = 400  # Always keep at least 400MB free
 
-# Parallel processing settings
-MIN_PARALLEL_SIZE_MB = 10  # Only parallelize files larger than this
-PARALLEL_CHUNK_LINES = 50000  # Lines per chunk for parallel processing
-
-
-def _process_lines_chunk(args: tuple) -> tuple[list[str], dict[str, int]]:
-    """
-    Process a chunk of lines in a worker process.
-
-    Must be at module level to be picklable for ProcessPoolExecutor.
-
-    Args:
-        args: Tuple of (lines_chunk, present_keywords)
-
-    Returns:
-        Tuple of (processed_lines, replacement_counts)
-    """
-    lines_chunk, present_keywords = args
-
-    # Import inside worker to get fresh matcher per process
-    from pattern_matcher import PatternMatcher, FastAnonymizer
-
-    matcher = PatternMatcher()
-    anonymizer = FastAnonymizer(matcher)
-
-    keyword_to_patterns = matcher._keyword_to_patterns
-
-    # Build applicable pattern IDs from present keywords
-    present_pattern_ids = set()
-    for kw in present_keywords:
-        for pattern in keyword_to_patterns.get(kw, []):
-            if not pattern.multiline:
-                present_pattern_ids.add(id(pattern))
-
-    # Process lines in-place
-    for i, line in enumerate(lines_chunk):
-        if not line:
-            continue
-
-        line_lower = line.lower()
-
-        # Check for keywords
-        has_keyword = False
-        for kw in present_keywords:
-            if kw in line_lower:
-                has_keyword = True
-                break
-
-        if not has_keyword:
-            continue
-
-        # Collect applicable patterns
-        seen_patterns = set()
-        applicable = []
-        for kw in present_keywords:
-            if kw in line_lower:
-                for pattern in keyword_to_patterns.get(kw, []):
-                    if id(pattern) in present_pattern_ids and id(pattern) not in seen_patterns:
-                        seen_patterns.add(id(pattern))
-                        applicable.append(pattern)
-
-        if not applicable:
-            continue
-
-        modified = line
-        for config in applicable:
-            modified = anonymizer.apply_pattern(config, modified)
-
-        if modified != line:
-            lines_chunk[i] = modified
-
-    return lines_chunk, dict(anonymizer.counts)
-
-
 def get_available_memory_mb() -> float:
     """Get available system memory in MB. Cross-platform."""
     try:
@@ -477,10 +403,7 @@ def process_large_file_streaming(
 ) -> tuple[dict[str, int], Optional[str]]:
     """
     Process a large file using streaming to reduce memory pressure.
-    Writes output directly to disk in chunks.
-
-    When Rust core is available, uses high-performance Rust processing.
-    Falls back to Python chunked processing when Rust is not available.
+    Writes output directly to disk in chunks using high-performance Rust processing.
 
     Args:
         data: Raw file content bytes
@@ -489,7 +412,7 @@ def process_large_file_streaming(
 
     Returns (counts_dict, error_string_or_none)
     """
-    from pattern_matcher import FastAnonymizer, RUST_CORE_AVAILABLE
+    from pattern_matcher import FastAnonymizer
 
     if is_likely_binary(data):
         output_path.write_bytes(data)
@@ -511,260 +434,96 @@ def process_large_file_streaming(
         return {}, None
 
     try:
-        # When Rust core is available, use memory-efficient byte-chunked processing
-        # This processes bytes directly without loading the entire file as a string
-        if RUST_CORE_AVAILABLE:
-            if cancel_check and cancel_check():
-                raise CancelledException("Processing cancelled by user")
+        if cancel_check and cancel_check():
+            raise CancelledException("Processing cancelled by user")
 
-            # Memory-efficient chunked processing with Rust
-            # Process in ~100MB chunks, decoding only each chunk
-            CHUNK_SIZE_BYTES = 100 * 1024 * 1024  # 100MB chunks
+        # Memory-efficient chunked processing with Rust
+        # Process in ~100MB chunks, decoding only each chunk
+        CHUNK_SIZE_BYTES = 100 * 1024 * 1024  # 100MB chunks
 
-            data_size = len(data)
-            matcher = get_matcher()
-            anonymizer = FastAnonymizer(matcher)
-            all_counts: dict[str, int] = defaultdict(int)
-
-            # For small files (< 200MB), process in one shot for simplicity
-            if data_size < CHUNK_SIZE_BYTES * 2:
-                content = data.decode(encoding_to_use)
-                del data  # Free bytes immediately
-                result, counts = anonymizer.process_content(content)
-                del content  # Free input before writing output
-                output_path.write_text(result, encoding="utf-8")
-                return dict(counts), None
-
-            # For large files, process bytes in chunks
-            # This keeps memory usage bounded: ~2x chunk size at any time
-            first_chunk = True
-            position = 0
-            leftover_bytes = b""  # Partial line from previous chunk
-
-            with open(output_path, 'w', encoding='utf-8', buffering=4*1024*1024) as f:
-                while position < data_size:
-                    if cancel_check and cancel_check():
-                        raise CancelledException("Processing cancelled by user")
-
-                    # Read chunk of bytes
-                    end_pos = min(position + CHUNK_SIZE_BYTES, data_size)
-                    chunk_bytes = leftover_bytes + data[position:end_pos]
-                    position = end_pos
-
-                    # Find last newline to avoid splitting mid-line
-                    if position < data_size:
-                        last_newline = chunk_bytes.rfind(b'\n')
-                        if last_newline != -1:
-                            leftover_bytes = chunk_bytes[last_newline + 1:]
-                            chunk_bytes = chunk_bytes[:last_newline + 1]
-                        else:
-                            # No newline found - keep accumulating (rare for text files)
-                            leftover_bytes = chunk_bytes
-                            continue
-                    else:
-                        leftover_bytes = b""
-
-                    # Decode only this chunk
-                    try:
-                        chunk_content = chunk_bytes.decode(encoding_to_use)
-                    except UnicodeDecodeError:
-                        # Fallback: try latin-1 which accepts any byte
-                        chunk_content = chunk_bytes.decode('latin-1')
-                    del chunk_bytes  # Free bytes
-
-                    # Process with Rust (preserve unique counters across chunks)
-                    chunk_result, chunk_counts = anonymizer.process_content(
-                        chunk_content, full_reset=first_chunk
-                    )
-                    first_chunk = False
-                    del chunk_content  # Free input chunk
-
-                    # Accumulate counts
-                    for cat, count in chunk_counts.items():
-                        all_counts[cat] += count
-
-                    # Write chunk result immediately and free memory
-                    f.write(chunk_result)
-                    del chunk_result  # Free output chunk
-
-                # Process any remaining leftover
-                if leftover_bytes:
-                    try:
-                        chunk_content = leftover_bytes.decode(encoding_to_use)
-                    except UnicodeDecodeError:
-                        chunk_content = leftover_bytes.decode('latin-1')
-
-                    chunk_result, chunk_counts = anonymizer.process_content(
-                        chunk_content, full_reset=False
-                    )
-                    for cat, count in chunk_counts.items():
-                        all_counts[cat] += count
-                    f.write(chunk_result)
-
-            # Free the original data now that we're done
-            del data
-            return dict(all_counts), None
-
-        # Fall back to Python streaming for memory efficiency when Rust is not available
-        # Decode full content for Python path (needed for line-by-line processing)
-        content = data.decode(encoding_to_use)
-        del data
+        data_size = len(data)
         matcher = get_matcher()
-        # Create a fresh anonymizer for this file
         anonymizer = FastAnonymizer(matcher)
+        all_counts: dict[str, int] = defaultdict(int)
 
-        # Pre-fetch for hot loop
-        multiline_patterns = matcher._multiline_patterns
-        all_keywords = matcher._all_keywords_lower
-        keyword_to_patterns = matcher._keyword_to_patterns
+        # For small files (< 200MB), process in one shot for simplicity
+        if data_size < CHUNK_SIZE_BYTES * 2:
+            content = data.decode(encoding_to_use)
+            del data  # Free bytes immediately
+            result, counts = anonymizer.process_content(content)
+            del content  # Free input before writing output
+            output_path.write_text(result, encoding="utf-8")
+            return dict(counts), None
 
-        # OPTIMIZATION: Scan for present keywords, then discard lowercase content
-        # This avoids keeping 2x memory for large files
-        content_lower_temp = content.lower()
-        present_keywords = [kw for kw in all_keywords if kw in content_lower_temp]
+        # For large files, process bytes in chunks
+        # This keeps memory usage bounded: ~2x chunk size at any time
+        first_chunk = True
+        position = 0
+        leftover_bytes = b""  # Partial line from previous chunk
 
-        # Fast path: no keywords present anywhere in file
-        if not present_keywords:
-            del content_lower_temp  # Free memory immediately
-            output_path.write_text(content, encoding="utf-8")
-            return {}, None
+        with open(output_path, 'w', encoding='utf-8', buffering=4*1024*1024) as f:
+            while position < data_size:
+                if cancel_check and cancel_check():
+                    raise CancelledException("Processing cancelled by user")
 
-        # First pass: handle multiline patterns on full content
-        for config in multiline_patterns:
-            if any(kw in content_lower_temp for kw in config.required_keywords):
-                content = anonymizer.apply_pattern(config, content)
-                content_lower_temp = content.lower()  # Update after modification
+                # Read chunk of bytes
+                end_pos = min(position + CHUNK_SIZE_BYTES, data_size)
+                chunk_bytes = leftover_bytes + data[position:end_pos]
+                position = end_pos
 
-        # Build set of applicable pattern IDs based on present keywords only
-        present_pattern_ids = set()
-        for kw in present_keywords:
-            for pattern in keyword_to_patterns.get(kw, []):
-                if not pattern.multiline:
-                    present_pattern_ids.add(id(pattern))
+                # Find last newline to avoid splitting mid-line
+                if position < data_size:
+                    last_newline = chunk_bytes.rfind(b'\n')
+                    if last_newline != -1:
+                        leftover_bytes = chunk_bytes[last_newline + 1:]
+                        chunk_bytes = chunk_bytes[:last_newline + 1]
+                    else:
+                        # No newline found - keep accumulating (rare for text files)
+                        leftover_bytes = chunk_bytes
+                        continue
+                else:
+                    leftover_bytes = b""
 
-        # Free the large lowercase string - we'll lowercase per-chunk instead
-        del content_lower_temp
+                # Decode only this chunk
+                try:
+                    chunk_content = chunk_bytes.decode(encoding_to_use)
+                except UnicodeDecodeError:
+                    # Fallback: try latin-1 which accepts any byte
+                    chunk_content = chunk_bytes.decode('latin-1')
+                del chunk_bytes  # Free bytes
 
-        # Fast path: no single-line patterns apply
-        if not present_pattern_ids:
-            output_path.write_text(content, encoding="utf-8")
-            return dict(anonymizer.counts), None
+                # Process with Rust (preserve unique counters across chunks)
+                chunk_result, chunk_counts = anonymizer.process_content(
+                    chunk_content, full_reset=first_chunk
+                )
+                first_chunk = False
+                del chunk_content  # Free input chunk
 
-        # Split content into lines
-        lines = content.split("\n")
-        total_lines = len(lines)
-
-        # Free original content string - we have it in lines now
-        del content
-
-        # Determine if parallel processing is beneficial
-        # Only parallelize if file is large enough (>10MB of lines)
-        content_size_mb = sum(len(line) for line in lines) / (1024 * 1024)
-        num_workers = min(4, multiprocessing.cpu_count())
-        use_parallel = content_size_mb >= MIN_PARALLEL_SIZE_MB and num_workers >= 2
-
-        if use_parallel:
-            # PARALLEL PROCESSING: Split into chunks and process in parallel
-            chunk_size = max(PARALLEL_CHUNK_LINES, total_lines // num_workers)
-            chunks = []
-            for i in range(0, total_lines, chunk_size):
-                chunk = lines[i:i + chunk_size]
-                chunks.append((chunk, present_keywords))
-
-            # Process chunks in parallel
-            all_counts: dict[str, int] = defaultdict(int)
-            processed_chunks = []
-
-            # Check for cancellation before starting parallel work
-            if cancel_check and cancel_check():
-                raise CancelledException("Processing cancelled by user")
-
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                results = list(executor.map(_process_lines_chunk, chunks))
-
-            # Check for cancellation after parallel work completes
-            if cancel_check and cancel_check():
-                raise CancelledException("Processing cancelled by user")
-
-            for processed_lines, chunk_counts in results:
-                processed_chunks.append(processed_lines)
+                # Accumulate counts
                 for cat, count in chunk_counts.items():
                     all_counts[cat] += count
 
-            # Write all processed chunks to file
-            with open(output_path, "w", encoding="utf-8", buffering=4 * 1024 * 1024) as f:
-                first = True
-                for chunk in processed_chunks:
-                    if not first:
-                        f.write("\n")
-                    f.write("\n".join(chunk))
-                    first = False
+                # Write chunk result immediately and free memory
+                f.write(chunk_result)
+                del chunk_result  # Free output chunk
 
-            return dict(all_counts), None
+            # Process any remaining leftover
+            if leftover_bytes:
+                try:
+                    chunk_content = leftover_bytes.decode(encoding_to_use)
+                except UnicodeDecodeError:
+                    chunk_content = leftover_bytes.decode('latin-1')
 
-        else:
-            # SEQUENTIAL PROCESSING: For smaller files, process in-place
-            CHUNK_LINES = 25000
+                chunk_result, chunk_counts = anonymizer.process_content(
+                    chunk_content, full_reset=False
+                )
+                for cat, count in chunk_counts.items():
+                    all_counts[cat] += count
+                f.write(chunk_result)
 
-            with open(
-                output_path, "w", encoding="utf-8", buffering=4 * 1024 * 1024
-            ) as f:
-                chunk_start = 0
-                first_chunk = True
-                while chunk_start < total_lines:
-                    # Check for cancellation between chunks
-                    if cancel_check and cancel_check():
-                        raise CancelledException("Processing cancelled by user")
-
-                    chunk_end = min(chunk_start + CHUNK_LINES, total_lines)
-                    chunk_lines = lines[chunk_start:chunk_end]
-
-                    # Process in-place using only present keywords
-                    for i, line in enumerate(chunk_lines):
-                        if not line:
-                            continue
-
-                        line_lower = line.lower()
-
-                        has_keyword = False
-                        for kw in present_keywords:
-                            if kw in line_lower:
-                                has_keyword = True
-                                break
-
-                        if not has_keyword:
-                            continue
-
-                        seen_patterns = set()
-                        applicable = []
-                        for kw in present_keywords:
-                            if kw in line_lower:
-                                for pattern in keyword_to_patterns.get(kw, []):
-                                    if (
-                                        id(pattern) in present_pattern_ids
-                                        and id(pattern) not in seen_patterns
-                                    ):
-                                        seen_patterns.add(id(pattern))
-                                        applicable.append(pattern)
-
-                        if not applicable:
-                            continue
-
-                        modified = line
-                        for config in applicable:
-                            modified = anonymizer.apply_pattern(config, modified)
-
-                        if modified != line:
-                            chunk_lines[i] = modified
-
-                    if not first_chunk:
-                        f.write("\n")
-                    f.write("\n".join(chunk_lines))
-                    first_chunk = False
-
-                    chunk_start = chunk_end
-
-            return dict(anonymizer.counts), None
+        # Free the original data now that we're done
+        del data
+        return dict(all_counts), None
 
     except Exception as e:
         # On error, write original data
@@ -1161,15 +920,61 @@ def main():
         action="store_true",
         help="Don't keep uncompressed directory (only create zip file)",
     )
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help="Generate a report showing examples of anonymized replacements",
+    )
+    parser.add_argument(
+        "--report-examples",
+        type=int,
+        default=5,
+        help="Number of examples per replacement type in report (default: 5)",
+    )
 
     args = parser.parse_args()
+
+    # For report mode, we need to keep both original and anonymized directories
+    # We extract the zip first, then process, then compare
+    zip_path = Path(args.zipfile)
+
+    if args.report:
+        import tempfile
+        import shutil as report_shutil
+
+        # Extract original zip to temp directory for comparison
+        original_temp_dir = Path(tempfile.mkdtemp(prefix="anonymizer_original_"))
+        print(f"Extracting original for report comparison...")
+
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                zf.extractall(original_temp_dir)
+        except Exception as e:
+            print(f"Error extracting zip: {e}")
+            sys.exit(1)
 
     success = process_zip(
         args.zipfile,
         args.workers,
         create_zip=not args.no_zip,
-        keep_uncompressed=not args.no_uncompressed,
+        keep_uncompressed=not args.no_uncompressed or args.report,  # Need uncompressed for report
     )
+
+    if success and args.report:
+        from replacement_report import generate_report
+
+        output_dir = zip_path.parent / (zip_path.stem + "_anonymized")
+
+        print("\n" + "=" * 60)
+        print("GENERATING REPLACEMENT REPORT")
+        print("=" * 60)
+
+        report = generate_report(original_temp_dir, output_dir, args.report_examples)
+        print(report)
+
+        # Clean up temp directory
+        report_shutil.rmtree(original_temp_dir)
+
     sys.exit(0 if success else 1)
 
 

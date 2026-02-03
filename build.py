@@ -3,17 +3,16 @@
 Build script to create a standalone executable for ZipLogsAnonymizer.
 
 Usage:
-    python build.py              # Build with Rust acceleration (if available)
-    python build.py --pure-python  # Build without Rust (pure Python mode)
+    python build.py
 
 This will create a single .exe file in the 'dist' folder that can be
 distributed to users without Python installed.
 
 Requirements:
     pip install pyinstaller
-    pip install maturin  (optional, for Rust acceleration)
+    pip install maturin
 
-For Rust acceleration:
+Rust is required for high-performance processing:
     1. Install Rust: https://rustup.rs/
     2. pip install maturin
     3. The build script will automatically compile the Rust extension
@@ -97,7 +96,9 @@ def build_rust_extension() -> Path | None:
 
     # Determine rustc command - use full path on Windows if we found the bin dir
     if cargo_bin is not None:
-        rustc_cmd = str(cargo_bin / ("rustc.exe" if sys.platform == "win32" else "rustc"))
+        rustc_cmd = str(
+            cargo_bin / ("rustc.exe" if sys.platform == "win32" else "rustc")
+        )
     else:
         rustc_cmd = "rustc"
 
@@ -154,12 +155,10 @@ def extract_rust_binary(wheel_path: Path) -> list[tuple[str, str]]:
     return binaries
 
 
-def build(pure_python: bool = False):
-    """Build the standalone executable."""
+def build():
+    """Build the standalone executable with Rust acceleration."""
     print("=" * 60)
     print("Building ZipLogsAnonymizer Executable")
-    if pure_python:
-        print("(Pure Python mode - no Rust acceleration)")
     print("=" * 60)
 
     # Check if PyInstaller is installed
@@ -178,12 +177,18 @@ def build(pure_python: bool = False):
             print(f"Cleaning {folder}/...")
             shutil.rmtree(folder)
 
-    # Try to build Rust extension (unless pure Python mode)
-    rust_binaries = []
-    if not pure_python:
-        wheel_path = build_rust_extension()
-        if wheel_path:
-            rust_binaries = extract_rust_binary(wheel_path)
+    # Build Rust extension (required)
+    wheel_path = build_rust_extension()
+    if not wheel_path:
+        print("\n" + "=" * 60)
+        print("BUILD FAILED: Rust extension is required")
+        print("=" * 60)
+        print("\nTo fix this:")
+        print("  1. Install Rust from: https://rustup.rs/")
+        print("  2. Install maturin: pip install maturin")
+        print("  3. Run this script again")
+        sys.exit(1)
+    rust_binaries = extract_rust_binary(wheel_path)
 
     # Determine platform-specific separator for --add-data
     # Windows uses ';', Mac/Linux use ':'
@@ -213,14 +218,11 @@ def build(pure_python: bool = False):
         "webview",
     ]
 
-    # Add Rust binaries if available
-    if rust_binaries:
-        cmd.extend(["--hidden-import", "anonymizer_core"])
-        for src, dst in rust_binaries:
-            cmd.extend(["--add-binary", f"{src}{separator}{dst}"])
-        print(f"\nIncluding Rust acceleration ({len(rust_binaries)} binary)")
-    else:
-        print("\nBuilding without Rust acceleration (pure Python)")
+    # Add Rust binaries (required)
+    cmd.extend(["--hidden-import", "anonymizer_core"])
+    for src, dst in rust_binaries:
+        cmd.extend(["--add-binary", f"{src}{separator}{dst}"])
+    print(f"\nIncluding Rust acceleration ({len(rust_binaries)} binary)")
 
     cmd.append("gui.py")
 
@@ -243,10 +245,6 @@ def build(pure_python: bool = False):
             print("=" * 60)
             print(f"\nExecutable: {exe_path.absolute()}")
             print(f"Size: {size_mb:.1f} MB")
-            if rust_binaries:
-                print("Mode: Rust-accelerated (300+ MB/s)")
-            else:
-                print("Mode: Pure Python (20-60 MB/s)")
         else:
             print("\nWarning: Build completed but executable not found.")
     else:
@@ -259,10 +257,5 @@ def build(pure_python: bool = False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build ZipLogsAnonymizer executable")
-    parser.add_argument(
-        "--pure-python",
-        action="store_true",
-        help="Build without Rust acceleration (pure Python mode)",
-    )
-    args = parser.parse_args()
-    build(pure_python=args.pure_python)
+    parser.parse_args()
+    build()

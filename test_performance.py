@@ -22,7 +22,7 @@ import string
 from io import StringIO
 import pytest
 
-from pattern_matcher import PatternMatcher, FastAnonymizer, anonymize_content, RUST_CORE_AVAILABLE
+from pattern_matcher import PatternMatcher, FastAnonymizer, anonymize_content
 
 
 # =============================================================================
@@ -30,18 +30,19 @@ from pattern_matcher import PatternMatcher, FastAnonymizer, anonymize_content, R
 # =============================================================================
 
 class TestRustBackend:
-    """Tests to verify Rust backend status and performance."""
+    """Tests to verify Rust backend is available and performant."""
 
-    def test_rust_core_status(self):
-        """Report whether Rust core is available (informational)."""
-        print(f"\n*** Rust core available: {RUST_CORE_AVAILABLE} ***")
-        # This test always passes - it's informational
-        assert True
+    def test_rust_core_available(self):
+        """Verify Rust core is available (required)."""
+        # Rust core is now mandatory - if we got here, import succeeded
+        print("\n*** Rust core is available ***")
+        # Create an anonymizer to verify it works
+        matcher = PatternMatcher()
+        anonymizer = FastAnonymizer(matcher)
+        assert anonymizer._rust_core is not None
 
-    def test_rust_speedup_when_available(self, matcher):
-        """If Rust is available, verify it provides significant speedup."""
-        if not RUST_CORE_AVAILABLE:
-            pytest.skip("Rust core not available - skipping speedup test")
+    def test_rust_speedup(self, matcher):
+        """Verify Rust provides expected throughput."""
 
         # Generate test content with ~5% sensitive lines
         # Use repeated values (more realistic than unique per-line)
@@ -595,18 +596,9 @@ class TestStreamingLargeFileProcessing:
         print(f"Streaming throughput:  {stream_throughput:.2f} MB/s")
         print(f"Streaming / In-memory: {stream_throughput/mem_throughput:.1%}")
 
-        # Streaming uses Python-level processing, while in-memory can use Rust core.
-        # When Rust is available, in-memory is much faster, so streaming will be
-        # a lower percentage. Require at least 5 MB/s absolute throughput for streaming.
-        # When Rust is not available, both paths are similar speed.
-        if RUST_CORE_AVAILABLE:
-            # With Rust, streaming (pure Python) will be slower than in-memory (Rust)
-            assert stream_throughput >= 5.0, \
-                f"Streaming too slow: {stream_throughput:.2f} MB/s (minimum 5 MB/s)"
-        else:
-            # Without Rust, streaming should be at least 70% of in-memory
-            assert stream_throughput >= mem_throughput * 0.7, \
-                f"Streaming too slow: {stream_throughput:.2f} vs {mem_throughput:.2f} MB/s"
+        # With Rust, streaming should achieve at least 5 MB/s absolute throughput
+        assert stream_throughput >= 5.0, \
+            f"Streaming too slow: {stream_throughput:.2f} MB/s (minimum 5 MB/s)"
 
     def test_streaming_with_clean_content_fast_path(self, matcher):
         """
@@ -706,18 +698,12 @@ class TestCPUUtilization:
         print(f"Speedup:              {parallel_throughput/sequential_throughput:.2f}x")
         print(f"CPU cores used:       {num_chunks}")
 
-        # ProcessPoolExecutor has significant startup overhead, especially when the
-        # Rust extension needs to be loaded in each worker process. With Rust enabled,
-        # sequential processing is already very fast, so parallel overhead dominates.
-        # Just verify parallel doesn't fail and achieves reasonable absolute throughput.
-        if RUST_CORE_AVAILABLE:
-            # With Rust, parallel may be slower due to process spawn + Rust init overhead
-            assert parallel_throughput >= 5.0, \
-                f"Parallel processing too slow: {parallel_throughput:.2f} MB/s (minimum 5 MB/s)"
-        else:
-            # Without Rust, parallel should provide some benefit
-            assert parallel_throughput >= sequential_throughput * 0.5, \
-                f"Parallel processing significantly slower than sequential"
+        # ProcessPoolExecutor has significant startup overhead when the Rust extension
+        # needs to be loaded in each worker process. With Rust, sequential processing
+        # is already very fast, so parallel overhead dominates. Just verify parallel
+        # doesn't fail and achieves reasonable absolute throughput.
+        assert parallel_throughput >= 5.0, \
+            f"Parallel processing too slow: {parallel_throughput:.2f} MB/s (minimum 5 MB/s)"
 
 
 # =============================================================================
