@@ -33,7 +33,7 @@ cd ZipLogsAnonymizer
 # 3. Run on your zip file
 python3 anonymizer.py /path/to/your/logs.zip
 
-# Optional: Use the GUI (requires tkinter)
+# Optional: Use the GUI (requires pywebview)
 python3 gui.py
 ```
 
@@ -258,26 +258,22 @@ By default, both a zip file and uncompressed directory are created. The zip file
 
 ### Building the Executable
 
+The build process compiles the Rust extension and bundles everything into a standalone executable.
+
 #### Windows
 
 ```bash
-# Install PyInstaller
-pip install pyinstaller
-
-# Run the build script
+# Run the build script (builds Rust extension automatically)
 python build.py
 ```
 
-This creates `dist/ZipLogsAnonymizer.exe` that runs without Python installed.
+This creates `dist/ZipLogsAnonymizer.exe` that runs without Python or Rust installed.
 
 #### Mac / Linux
 
 Mac users can build a native executable, but it must be built on a Mac:
 
 ```bash
-# Install PyInstaller
-pip3 install pyinstaller
-
 # Run the build script
 python3 build.py
 ```
