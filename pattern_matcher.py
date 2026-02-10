@@ -17,16 +17,51 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional, Callable
 
-# Import Rust core for high-performance processing (required)
+# Import Rust core for high-performance processing (required at point of use).
+# Soft-fail at import time so auto-build has a chance to run first.
+_rust_core_available = False
+_rust_import_error = None
+
 try:
-    from anonymizer_core import AnonymizerCore, is_rust_core_available
-    if not is_rust_core_available():
-        raise RuntimeError("Rust core reports unavailable")
+    from anonymizer_core import AnonymizerCore, is_rust_core_available as _is_rust_available
+    if _is_rust_available():
+        _rust_core_available = True
+    else:
+        _rust_import_error = "Rust core reports unavailable"
 except ImportError as e:
-    raise ImportError(
-        "Rust anonymization core (anonymizer_core) is required but not found. "
-        "Please build the Rust extension with: cd rust_core && maturin develop --release"
-    ) from e
+    _rust_import_error = str(e)
+    AnonymizerCore = None
+
+    def _is_rust_available():
+        return False
+
+
+def check_rust_core():
+    """Raise ImportError if the Rust core is not available.
+    Called at the point of actual use, not at import time.
+    """
+    if not _rust_core_available:
+        raise ImportError(
+            "Rust anonymization core (anonymizer_core) is required but not found. "
+            "Please build the Rust extension with: cd rust_core && maturin develop --release\n"
+            f"Original error: {_rust_import_error}"
+        )
+
+
+def reload_rust_core():
+    """Re-attempt importing the Rust core (after auto-build)."""
+    global _rust_core_available, _rust_import_error, AnonymizerCore
+    try:
+        import importlib
+        mod = importlib.import_module('anonymizer_core')
+        AnonymizerCore = mod.AnonymizerCore
+        if mod.is_rust_core_available():
+            _rust_core_available = True
+            _rust_import_error = None
+        else:
+            _rust_import_error = "Rust core reports unavailable after reload"
+    except ImportError as e:
+        _rust_import_error = str(e)
 
 
 @dataclass
@@ -354,6 +389,7 @@ class FastAnonymizer:
     """
 
     def __init__(self, matcher: PatternMatcher):
+        check_rust_core()
         self.matcher = matcher
         self.counts: dict[str, int] = defaultdict(int)
         self.unique_counters: dict[str, dict[str, int]] = defaultdict(dict)

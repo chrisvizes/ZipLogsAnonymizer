@@ -26,37 +26,7 @@ import zipfile
 from pathlib import Path
 
 
-def get_rust_env() -> tuple[dict, Path] | None:
-    """Get environment with Rust toolchain in PATH and the cargo bin path.
-
-    Returns (modified environment dict, cargo_bin_path), or None if Rust not found.
-    """
-    import os
-
-    # Check common Rust installation locations
-    cargo_bin_paths = [
-        Path.home() / ".cargo" / "bin",  # Default rustup location
-        Path("C:/Users") / os.environ.get("USERNAME", "") / ".cargo" / "bin",
-    ]
-
-    env = os.environ.copy()
-
-    for cargo_bin in cargo_bin_paths:
-        rustc_path = cargo_bin / ("rustc.exe" if sys.platform == "win32" else "rustc")
-        if rustc_path.exists():
-            # Add cargo bin to PATH
-            env["PATH"] = str(cargo_bin) + os.pathsep + env.get("PATH", "")
-            return env, cargo_bin
-
-    # Rust not found in common locations, check if already in PATH
-    try:
-        result = subprocess.run(["rustc", "--version"], capture_output=True, text=True)
-        if result.returncode == 0:
-            return env, None  # Rust is in PATH, no specific bin dir needed
-    except FileNotFoundError:
-        pass
-
-    return None
+from rust_build_helper import get_rust_env
 
 
 def build_rust_extension() -> Path | None:

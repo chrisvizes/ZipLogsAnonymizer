@@ -898,6 +898,10 @@ def process_zip(
 
 
 def main():
+    # Ensure Rust core is available (auto-build if needed)
+    from rust_build_helper import ensure_rust_core
+    ensure_rust_core(progress_callback=print)
+
     parser = argparse.ArgumentParser(
         description="Anonymize sensitive data in log archives.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -920,60 +924,15 @@ def main():
         action="store_true",
         help="Don't keep uncompressed directory (only create zip file)",
     )
-    parser.add_argument(
-        "--report",
-        action="store_true",
-        help="Generate a report showing examples of anonymized replacements",
-    )
-    parser.add_argument(
-        "--report-examples",
-        type=int,
-        default=5,
-        help="Number of examples per replacement type in report (default: 5)",
-    )
 
     args = parser.parse_args()
-
-    # For report mode, we need to keep both original and anonymized directories
-    # We extract the zip first, then process, then compare
-    zip_path = Path(args.zipfile)
-
-    if args.report:
-        import tempfile
-        import shutil as report_shutil
-
-        # Extract original zip to temp directory for comparison
-        original_temp_dir = Path(tempfile.mkdtemp(prefix="anonymizer_original_"))
-        print(f"Extracting original for report comparison...")
-
-        try:
-            with zipfile.ZipFile(zip_path, 'r') as zf:
-                zf.extractall(original_temp_dir)
-        except Exception as e:
-            print(f"Error extracting zip: {e}")
-            sys.exit(1)
 
     success = process_zip(
         args.zipfile,
         args.workers,
         create_zip=not args.no_zip,
-        keep_uncompressed=not args.no_uncompressed or args.report,  # Need uncompressed for report
+        keep_uncompressed=not args.no_uncompressed,
     )
-
-    if success and args.report:
-        from replacement_report import generate_report
-
-        output_dir = zip_path.parent / (zip_path.stem + "_anonymized")
-
-        print("\n" + "=" * 60)
-        print("GENERATING REPLACEMENT REPORT")
-        print("=" * 60)
-
-        report = generate_report(original_temp_dir, output_dir, args.report_examples)
-        print(report)
-
-        # Clean up temp directory
-        report_shutil.rmtree(original_temp_dir)
 
     sys.exit(0 if success else 1)
 

@@ -26,7 +26,24 @@ if not _is_worker_process():
 
     import webview
 
-    from anonymizer import process_zip, TEXT_EXTENSIONS, LARGE_FILE_THRESHOLD
+    # Lazy-loaded anonymizer module (deferred to avoid blocking GUI startup)
+    _anonymizer_module = None
+    _anonymizer_lock = threading.Lock()
+
+    def _get_anonymizer():
+        """Lazy-load the anonymizer module on first use."""
+        global _anonymizer_module
+        if _anonymizer_module is not None:
+            return _anonymizer_module
+        with _anonymizer_lock:
+            if _anonymizer_module is not None:
+                return _anonymizer_module
+            if not getattr(sys, 'frozen', False):
+                from rust_build_helper import ensure_rust_core
+                ensure_rust_core()
+            import anonymizer
+            _anonymizer_module = anonymizer
+            return anonymizer
 
     def get_assets_path():
         """Get the path to GUI assets, handling both dev and frozen modes."""
@@ -74,25 +91,31 @@ if not _is_worker_process():
             """Handle file selection."""
             zip_path = Path(file_path)
 
-            # Update UI
+            # Update UI immediately
             self.window.evaluate_js(f'setFilePath({json.dumps(str(file_path))})')
-            self.window.evaluate_js('setButtonState("process-btn", true)')
+            self.window.evaluate_js('setButtonState("process-btn", false)')
             self.window.evaluate_js('setButtonState("open-folder-btn", false)')
-            self.window.evaluate_js(f'setStatus("Selected: {zip_path.name}")')
+            self.window.evaluate_js(f'setStatus("Analyzing: {zip_path.name}...")')
             self.window.evaluate_js('resetStats()')
 
             # Store path
             self.current_file = file_path
             self.output_dir = zip_path.parent / (zip_path.stem + "_anonymized")
 
-            # Analyze zip file and initialize treemap
-            self._analyze_and_init_treemap(file_path)
+            # Analyze zip file in background thread
+            threading.Thread(
+                target=self._analyze_and_init_treemap,
+                args=(file_path,),
+                daemon=True,
+            ).start()
 
         def _analyze_and_init_treemap(self, zip_path: str):
-            """Analyze zip file and send manifest to treemap."""
+            """Analyze zip file and send manifest to treemap (runs on background thread)."""
             import zipfile
 
             try:
+                anon = _get_anonymizer()
+
                 with zipfile.ZipFile(zip_path, 'r') as zf:
                     entries = [e for e in zf.infolist() if not e.is_dir()]
 
@@ -107,8 +130,8 @@ if not _is_worker_process():
                         ext = Path(entry.filename).suffix.lower()
                         size_mb = entry.file_size / (1024 * 1024)
 
-                        if ext in TEXT_EXTENSIONS:
-                            if entry.file_size >= LARGE_FILE_THRESHOLD:
+                        if ext in anon.TEXT_EXTENSIONS:
+                            if entry.file_size >= anon.LARGE_FILE_THRESHOLD:
                                 large_files.append({
                                     'name': entry.filename,
                                     'size_mb': round(size_mb, 2)
@@ -136,8 +159,15 @@ if not _is_worker_process():
                     # Send to JavaScript
                     self.window.evaluate_js(f'initTreemap({json.dumps(manifest)})')
 
+                zip_name = Path(zip_path).name
+                self.window.evaluate_js(f'setStatus("Selected: {zip_name}")')
+                self.window.evaluate_js('setButtonState("process-btn", true)')
+
+            except zipfile.BadZipFile:
+                self.window.evaluate_js('setStatus("Error: File is not a valid zip archive.")')
             except Exception as e:
-                self.window.evaluate_js(f'setStatus("Error reading zip: {str(e)}")')
+                error_msg = str(e).replace('"', '\\\\"')
+                self.window.evaluate_js(f'setStatus("Error reading zip: {error_msg}")')
 
         def start_processing(self):
             """Start the anonymization process."""
@@ -173,7 +203,8 @@ if not _is_worker_process():
                 create_zip = options.get('createZip', True)
                 keep_uncompressed = options.get('keepUncompressed', True)
 
-                success = process_zip(
+                anon = _get_anonymizer()
+                success = anon.process_zip(
                     zip_path,
                     cancel_check=self._check_cancel,
                     progress_callback=self._progress_callback,
