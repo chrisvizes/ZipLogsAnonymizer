@@ -608,7 +608,34 @@ function processingComplete(success, outputPath, outputZipPath) {
     }
 }
 
-// Initialize when DOM is ready
-document.addEventListener('DOMContentLoaded', () => {
-    console.log('Treemap visualization loaded');
-});
+// Enable UI only after BOTH pywebview API and all page resources are ready
+(function() {
+    let apiReady = false;
+    let pageLoaded = false;
+
+    function tryEnable() {
+        if (apiReady && pageLoaded) {
+            document.getElementById('browse-btn').disabled = false;
+        }
+    }
+
+    window.addEventListener('pywebviewready', () => {
+        apiReady = true;
+        tryEnable();
+    });
+
+    window.addEventListener('load', () => {
+        pageLoaded = true;
+        tryEnable();
+    });
+
+    // If pywebview API is already available (e.g. events fired before script ran)
+    if (window.pywebview && window.pywebview.api) {
+        apiReady = true;
+        tryEnable();
+    }
+    if (document.readyState === 'complete') {
+        pageLoaded = true;
+        tryEnable();
+    }
+})();

@@ -204,13 +204,19 @@ if not _is_worker_process():
                 keep_uncompressed = options.get('keepUncompressed', True)
 
                 anon = _get_anonymizer()
-                success = anon.process_zip(
-                    zip_path,
-                    cancel_check=self._check_cancel,
-                    progress_callback=self._progress_callback,
-                    create_zip=create_zip,
-                    keep_uncompressed=keep_uncompressed
-                )
+
+                # Capture stdout/stderr so errors from process_zip are visible in GUI
+                import io
+                import contextlib
+                captured = io.StringIO()
+                with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+                    success = anon.process_zip(
+                        zip_path,
+                        cancel_check=self._check_cancel,
+                        progress_callback=self._progress_callback,
+                        create_zip=create_zip,
+                        keep_uncompressed=keep_uncompressed
+                    )
 
                 # Determine output paths
                 zip_file = Path(zip_path)
@@ -227,12 +233,20 @@ if not _is_worker_process():
                     f'processingComplete({json.dumps(success and not was_cancelled)}, {json.dumps(output_dir_path)}, {json.dumps(output_zip_path)})'
                 )
 
-                # Update final state
-                self._on_processing_complete(success, was_cancelled)
+                # Extract error info from captured output if processing failed
+                error_msg = None
+                if not success and not was_cancelled:
+                    output = captured.getvalue()
+                    # Find error lines in captured output
+                    error_lines = [l for l in output.splitlines() if 'error' in l.lower() or 'traceback' in l.lower()]
+                    error_msg = error_lines[-1] if error_lines else None
+
+                self._on_processing_complete(success, was_cancelled, error_msg)
 
             except Exception as e:
-                print(f"Processing error: {e}")
-                self._on_processing_complete(False, False)
+                import traceback
+                traceback.print_exc()
+                self._on_processing_complete(False, False, str(e))
 
         def _check_cancel(self) -> bool:
             """Check if cancellation was requested."""
@@ -271,7 +285,7 @@ if not _is_worker_process():
             elif event_type == 'creating_zip':
                 self.window.evaluate_js('showCreatingZip()')
 
-        def _on_processing_complete(self, success: bool, was_cancelled: bool):
+        def _on_processing_complete(self, success: bool, was_cancelled: bool, error_msg: str = None):
             """Handle processing completion."""
             self.processing = False
             self.cancel_requested = False
@@ -288,7 +302,11 @@ if not _is_worker_process():
                 self.window.evaluate_js('setStatus("Complete! Output ready.")')
                 self.window.evaluate_js('setButtonState("open-folder-btn", true)')
             else:
-                self.window.evaluate_js('setStatus("Processing failed. Check console for details.")')
+                if error_msg:
+                    safe_msg = error_msg.replace('\\', '\\\\').replace('"', '\\"')
+                    self.window.evaluate_js(f'setStatus("Processing failed: {safe_msg}")')
+                else:
+                    self.window.evaluate_js('setStatus("Processing failed.")')
                 self.output_dir = None
 
         def cancel_processing(self):

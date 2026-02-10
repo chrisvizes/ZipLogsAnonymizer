@@ -66,6 +66,50 @@ LARGE_FILE_THRESHOLD = (
 MEMORY_SAFETY_FACTOR = 2.0  # Assume each file needs ~2x its size in memory (read + output buffer)
 MIN_FREE_MEMORY_MB = 400  # Always keep at least 400MB free
 
+# Windows reserved device names - cannot be used as filenames
+_WINDOWS_RESERVED = frozenset({
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+})
+
+
+def sanitize_filename(filename: str) -> str:
+    """Sanitize a zip entry filename to avoid Windows reserved device names.
+
+    On Windows, names like NUL, CON, PRN, AUX, COM1-9, LPT1-9 cannot be
+    created as files. This prefixes them with an underscore.
+    """
+    if sys.platform != "win32":
+        return filename
+    parts = Path(filename).parts
+    sanitized = []
+    for part in parts:
+        stem = Path(part).stem.upper()
+        if stem in _WINDOWS_RESERVED:
+            part = f"_{part}"
+        sanitized.append(part)
+    return str(Path(*sanitized)) if sanitized else filename
+
+
+def safe_rmtree(path: Path):
+    """Remove a directory tree, handling Windows reserved filenames like NUL."""
+    import shutil
+    try:
+        shutil.rmtree(path)
+    except PermissionError:
+        if sys.platform == "win32":
+            import subprocess
+            # Use \\?\ prefix to bypass Windows reserved name restrictions
+            win_path = f"\\\\?\\{path.resolve()}"
+            subprocess.run(
+                ["cmd", "/c", f'rmdir /s /q "{win_path}"'],
+                capture_output=True,
+            )
+        else:
+            raise
+
+
 def get_available_memory_mb() -> float:
     """Get available system memory in MB. Cross-platform."""
     try:
@@ -588,7 +632,7 @@ def process_zip(
 
     # Clean up any existing output
     if output_dir.exists():
-        shutil.rmtree(output_dir)
+        safe_rmtree(output_dir)
 
     if max_workers is None:
         max_workers = min(multiprocessing.cpu_count(), 8)
@@ -623,7 +667,7 @@ def process_zip(
             # Create all subdirectories first
             for entry in src_zip.infolist():
                 if entry.is_dir():
-                    (output_dir / entry.filename).mkdir(parents=True, exist_ok=True)
+                    (output_dir / sanitize_filename(entry.filename)).mkdir(parents=True, exist_ok=True)
 
             # Phase 1: Copy binary files directly (no processing needed)
             # Silent copy - no progress bar needed for binary files
@@ -633,7 +677,7 @@ def process_zip(
                 for entry in binary_entries:
                     check_cancelled()
                     data = src_zip.read(entry.filename)
-                    out_path = output_dir / entry.filename
+                    out_path = output_dir / sanitize_filename(entry.filename)
                     out_path.parent.mkdir(parents=True, exist_ok=True)
                     out_path.write_bytes(data)
                 print(f"Copied {len(binary_entries)} binary files")
@@ -675,7 +719,7 @@ def process_zip(
                         notify_progress({"type": "file_status", "name": entry.filename, "status": "in_progress"})
                         data = src_zip.read(entry.filename)
 
-                        out_path = output_dir / entry.filename
+                        out_path = output_dir / sanitize_filename(entry.filename)
                         out_path.parent.mkdir(parents=True, exist_ok=True)
 
                         # Use streaming for very large files to reduce memory pressure
@@ -785,7 +829,7 @@ def process_zip(
                                     result = completed.result()
 
                                     # Write result to disk immediately
-                                    out_path = output_dir / result.filename
+                                    out_path = output_dir / sanitize_filename(result.filename)
                                     out_path.parent.mkdir(parents=True, exist_ok=True)
                                     out_path.write_bytes(result.content)
 
@@ -845,7 +889,7 @@ def process_zip(
 
         # Remove uncompressed directory if not keeping it
         if create_zip and not keep_uncompressed:
-            shutil.rmtree(output_dir)
+            safe_rmtree(output_dir)
             output_dir = None
 
         # Print results
@@ -882,7 +926,7 @@ def process_zip(
         # Clean up partial output
         if output_dir.exists():
             print(f"Cleaning up partial output: {output_dir}")
-            shutil.rmtree(output_dir)
+            safe_rmtree(output_dir)
         print("Cancelled successfully - no output created.")
         return False
 
@@ -893,7 +937,7 @@ def process_zip(
         traceback.print_exc()
         # Clean up on failure
         if output_dir.exists():
-            shutil.rmtree(output_dir)
+            safe_rmtree(output_dir)
         return False
 
 
