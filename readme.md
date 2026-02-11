@@ -84,12 +84,20 @@ The following sensitive data patterns are detected and replaced:
 
 ### Tableau-Specific
 
-| Data Type        | Detection Method      | Example                   | Replacement            |
-| ---------------- | --------------------- | ------------------------- | ---------------------- |
-| Site Names       | `site=` context       | `site=CustomerPortal`     | `site=entity001`       |
-| Workbook Names   | `workbook=` context   | `workbook=SalesReport`    | `workbook=entity002`   |
-| Datasource Names | `datasource=` context | `datasource=ProductionDB` | `datasource=entity003` |
-| Project Names    | `project=` context    | `project=Finance`         | `project=entity004`    |
+| Data Type | Detection Method | Example | Replacement |
+| --- | --- | --- | --- |
+| Site Names | `site=` context or `/t/SITE/` URL path | `site=CustomerPortal` or `/t/CustomerPortal/` | `site=entity001` or `/t/entity001/` |
+| Workbook Names | `workbook=` context or URL paths (`/vizql/w/`, `/views/`, `/authoring/`) | `/vizql/w/SalesReport/v/Overview/startSession` | `/vizql/w/entity002/v/entity003/startSession` |
+| View Names | URL paths (`/vizql/w/.../v/`, `/views/.../`, `/authoring/.../`) | `/views/SalesReport/Overview?:iid=1` | `/views/entity002/entity003?:iid=1` |
+| Datasource Names | `datasource=` context | `datasource=ProductionDB` | `datasource=entity004` |
+| Project Names | `project=` context | `project=Finance` | `project=entity005` |
+
+URL path detection covers the most common Tableau Server URL structures:
+
+- `/vizql/w/WORKBOOK/v/VIEW/...` - VizQL rendering endpoints
+- `/views/WORKBOOK/VIEW?...` - Direct view URLs
+- `/authoring/WORKBOOK/VIEW?...` - Authoring mode URLs
+- `/t/SITE/...` - Multi-site URL prefix
 
 ### Consistency Guarantee
 

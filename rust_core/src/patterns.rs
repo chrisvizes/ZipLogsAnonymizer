@@ -210,7 +210,87 @@ pub fn build_patterns() -> Vec<PatternConfig> {
             true,
         ),
 
-        // Tableau-specific entities
+        // Tableau URL path patterns - content names in URL paths
+        // Must be defined BEFORE key=value tableau_entity pattern.
+
+        // Site name from /t/SITE_NAME/...
+        PatternConfig::new(
+            "tableau_entity",
+            r"(/t/)([^/]+)",
+            "${1}{UNIQUE}",
+            true,
+            vec!["/t/"],
+            false,
+            false,
+        ),
+
+        // VizQL workbook from /vizql/w/WORKBOOK/...
+        PatternConfig::new(
+            "tableau_entity",
+            r"(/vizql/w/)([^/]+)",
+            "${1}{UNIQUE}",
+            true,
+            vec!["/vizql/"],
+            false,
+            false,
+        ),
+
+        // VizQL view from /vizql/w/.../v/VIEW/...
+        PatternConfig::new(
+            "tableau_entity",
+            r"(/vizql/w/[^/]+/v/)([^/]+)",
+            "${1}{UNIQUE}",
+            true,
+            vec!["/vizql/"],
+            false,
+            false,
+        ),
+
+        // Views workbook from /views/WORKBOOK/...
+        PatternConfig::new(
+            "tableau_entity",
+            r"(/views/)([^/]+)",
+            "${1}{UNIQUE}",
+            true,
+            vec!["/views/"],
+            false,
+            false,
+        ),
+
+        // Views view from /views/.../VIEW?...
+        PatternConfig::new(
+            "tableau_entity",
+            r"(/views/[^/]+/)([^/?#\s]+)",
+            "${1}{UNIQUE}",
+            true,
+            vec!["/views/"],
+            false,
+            false,
+        ),
+
+        // Authoring workbook from /authoring/WORKBOOK/...
+        PatternConfig::new(
+            "tableau_entity",
+            r"(/authoring/)([^/]+)",
+            "${1}{UNIQUE}",
+            true,
+            vec!["/authoring/"],
+            false,
+            false,
+        ),
+
+        // Authoring view from /authoring/.../VIEW?...
+        PatternConfig::new(
+            "tableau_entity",
+            r"(/authoring/[^/]+/)([^/?#\s]+)",
+            "${1}{UNIQUE}",
+            true,
+            vec!["/authoring/"],
+            false,
+            false,
+        ),
+
+        // Tableau-specific entities (key=value context)
         PatternConfig::new(
             "tableau_entity",
             r#"((?:site|workbook|datasource|project)\s*[=:]\s*)([^\s,;\\'"\}\]]+)"#,

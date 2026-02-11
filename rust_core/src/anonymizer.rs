@@ -139,9 +139,17 @@ impl RustAnonymizer {
                         }
                     }
 
+                    // Use value portion (after prefix) as the unique key so the
+                    // same content name gets the same replacement across contexts
+                    // (e.g., /vizql/w/X, /views/X, and site=X all map X to entity001)
+                    let value_key = if !prefix.is_empty() && original.starts_with(&prefix) {
+                        &original[prefix.len()..]
+                    } else {
+                        original
+                    };
                     let replacement_template = config.replacement.replace("${1}", "");
                     let unique_part =
-                        self.get_unique_replacement(config.name, original, &replacement_template);
+                        self.get_unique_replacement(config.name, value_key, &replacement_template);
                     format!("{}{}", prefix, unique_part)
                 } else {
                     self.get_unique_replacement(config.name, original, config.replacement)

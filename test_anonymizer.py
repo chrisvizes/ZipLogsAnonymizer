@@ -467,6 +467,118 @@ class TestTableauEntityPattern:
         assert "Marketing_Analytics" not in result
         assert counts["tableau_entity"] == 1
 
+    def test_vizql_workbook_url(self, matcher):
+        """VizQL workbook name in URL path should be anonymized."""
+        content = "POST /vizql/w/SalesReport/v/Overview/startSession HTTP/1.1"
+        result, counts = anonymize_content(content, matcher)
+        assert "SalesReport" not in result
+        assert "/vizql/w/" in result
+        assert counts["tableau_entity"] >= 1
+
+    def test_vizql_view_url(self, matcher):
+        """VizQL view name in URL path should be anonymized."""
+        content = "POST /vizql/w/SalesReport/v/Overview/startSession HTTP/1.1"
+        result, counts = anonymize_content(content, matcher)
+        assert "Overview" not in result
+        assert counts["tableau_entity"] >= 2
+
+    def test_views_workbook_url(self, matcher):
+        """Workbook name in /views/ URL should be anonymized."""
+        content = "GET /views/SalesReport/Overview?:iid=1 HTTP/1.1"
+        result, counts = anonymize_content(content, matcher)
+        assert "SalesReport" not in result
+        assert "/views/" in result
+        assert counts["tableau_entity"] >= 1
+
+    def test_views_view_url(self, matcher):
+        """View name in /views/ URL should be anonymized."""
+        content = "GET /views/SalesReport/Overview?:iid=1 HTTP/1.1"
+        result, counts = anonymize_content(content, matcher)
+        assert "Overview" not in result
+        assert counts["tableau_entity"] >= 2
+
+    def test_site_url(self, matcher):
+        """Site name in /t/ URL should be anonymized."""
+        content = "GET /t/MySite/views/WorkbookName/ViewName HTTP/1.1"
+        result, counts = anonymize_content(content, matcher)
+        assert "MySite" not in result
+        assert "/t/" in result
+        assert counts["tableau_entity"] >= 1
+
+    def test_authoring_workbook_url(self, matcher):
+        """Workbook name in /authoring/ URL should be anonymized."""
+        content = "GET /authoring/WorkbookName/ViewName HTTP/1.1"
+        result, counts = anonymize_content(content, matcher)
+        assert "WorkbookName" not in result
+        assert "/authoring/" in result
+
+    def test_authoring_view_url(self, matcher):
+        """View name in /authoring/ URL should be anonymized."""
+        content = "GET /authoring/WorkbookName/ViewName HTTP/1.1"
+        result, counts = anonymize_content(content, matcher)
+        assert "ViewName" not in result
+        assert counts["tableau_entity"] >= 2
+
+    def test_url_content_consistency(self, matcher):
+        """Same content name across different URL patterns should get same replacement."""
+        import re as re_mod
+        content = (
+            "GET /vizql/w/SalesReport/v/Overview/startSession HTTP/1.1\n"
+            "GET /views/SalesReport/Overview?:iid=1 HTTP/1.1\n"
+            "workbook=SalesReport"
+        )
+        result, counts = anonymize_content(content, matcher)
+        assert "SalesReport" not in result
+        assert "Overview" not in result
+        # Same content name should map to same entity across all contexts
+        entities = re_mod.findall(r'entity\d+', result)
+        unique_entities = set(entities)
+        assert len(unique_entities) == 2, (
+            f"Expected 2 unique entities (SalesReport + Overview), "
+            f"got {len(unique_entities)}: {unique_entities}"
+        )
+
+    def test_full_http_request_line(self, matcher):
+        """Realistic HTTP request line with VizQL URL should be fully anonymized."""
+        content = (
+            "POST /vizql/w/Learning_Analytics_Dashboard/v/HOME/startSession/viewing"
+            "?cv_HIUK7LY46Y8cIKz2MjzNQQ==0&keepAlive=true HTTP/1.1"
+        )
+        result, counts = anonymize_content(content, matcher)
+        assert "Learning_Analytics_Dashboard" not in result
+        assert "HOME" not in result
+        assert "startSession" in result
+        assert "keepAlive" in result
+
+    def test_url_with_query_params(self, matcher):
+        """Query parameters should NOT be captured as part of content name."""
+        content = "GET /views/MyWorkbook/MyView?:iid=1&:refresh=yes HTTP/1.1"
+        result, counts = anonymize_content(content, matcher)
+        assert "MyWorkbook" not in result
+        assert "MyView" not in result
+        assert ":iid=1" in result
+        assert ":refresh=yes" in result
+
+    def test_url_and_context_same_line(self, matcher):
+        """Line with both URL path and key=value context should anonymize both."""
+        content = (
+            "POST /vizql/w/SalesReport/v/Overview/startSession "
+            "workbook=SalesReport site=MySite"
+        )
+        result, counts = anonymize_content(content, matcher)
+        assert "SalesReport" not in result
+        assert "Overview" not in result
+        assert "MySite" not in result
+
+    def test_full_tableau_url_with_site(self, matcher):
+        """Full Tableau Server URL with site, workbook, and view."""
+        content = "tableau.example.com/t/Sales/views/Revenue_Dashboard/Q4_Summary?:iid=1"
+        result, counts = anonymize_content(content, matcher)
+        assert "Sales" not in result
+        assert "Revenue_Dashboard" not in result
+        assert "Q4_Summary" not in result
+        assert counts["tableau_entity"] >= 3
+
 
 class TestProcessSingleFile:
     """Tests for the file processing function."""

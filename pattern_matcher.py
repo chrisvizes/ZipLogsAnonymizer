@@ -328,7 +328,88 @@ class PatternMatcher:
             )
         )
 
-        # Tableau-specific entities
+        # Tableau URL path patterns - content names in URL paths
+        # These must be defined BEFORE the key=value tableau_entity pattern
+        # so they get lower indices and are applied first.
+
+        # Site name from /t/SITE_NAME/...
+        patterns.append(
+            PatternConfig(
+                name="tableau_entity",
+                pattern=re.compile(r'(/t/)([^/]+)'),
+                replacement=r"\1{UNIQUE}",
+                uses_groups=True,
+                required_keywords=frozenset(["/t/"]),
+            )
+        )
+
+        # VizQL workbook from /vizql/w/WORKBOOK/...
+        patterns.append(
+            PatternConfig(
+                name="tableau_entity",
+                pattern=re.compile(r'(/vizql/w/)([^/]+)'),
+                replacement=r"\1{UNIQUE}",
+                uses_groups=True,
+                required_keywords=frozenset(["/vizql/"]),
+            )
+        )
+
+        # VizQL view from /vizql/w/.../v/VIEW/...
+        patterns.append(
+            PatternConfig(
+                name="tableau_entity",
+                pattern=re.compile(r'(/vizql/w/[^/]+/v/)([^/]+)'),
+                replacement=r"\1{UNIQUE}",
+                uses_groups=True,
+                required_keywords=frozenset(["/vizql/"]),
+            )
+        )
+
+        # Views workbook from /views/WORKBOOK/...
+        patterns.append(
+            PatternConfig(
+                name="tableau_entity",
+                pattern=re.compile(r'(/views/)([^/]+)'),
+                replacement=r"\1{UNIQUE}",
+                uses_groups=True,
+                required_keywords=frozenset(["/views/"]),
+            )
+        )
+
+        # Views view from /views/.../VIEW?...
+        patterns.append(
+            PatternConfig(
+                name="tableau_entity",
+                pattern=re.compile(r'(/views/[^/]+/)([^/?#\s]+)'),
+                replacement=r"\1{UNIQUE}",
+                uses_groups=True,
+                required_keywords=frozenset(["/views/"]),
+            )
+        )
+
+        # Authoring workbook from /authoring/WORKBOOK/...
+        patterns.append(
+            PatternConfig(
+                name="tableau_entity",
+                pattern=re.compile(r'(/authoring/)([^/]+)'),
+                replacement=r"\1{UNIQUE}",
+                uses_groups=True,
+                required_keywords=frozenset(["/authoring/"]),
+            )
+        )
+
+        # Authoring view from /authoring/.../VIEW?...
+        patterns.append(
+            PatternConfig(
+                name="tableau_entity",
+                pattern=re.compile(r'(/authoring/[^/]+/)([^/?#\s]+)'),
+                replacement=r"\1{UNIQUE}",
+                uses_groups=True,
+                required_keywords=frozenset(["/authoring/"]),
+            )
+        )
+
+        # Tableau-specific entities (key=value context)
         patterns.append(
             PatternConfig(
                 name="tableau_entity",
@@ -450,8 +531,11 @@ class FastAnonymizer:
                         if grp is not None:
                             prefix = grp
                             break
+                    # Use value portion (after prefix) as the unique key so the
+                    # same content name gets the same replacement across contexts
+                    value_key = original[len(prefix):] if prefix else original
                     return prefix + self.get_unique_replacement(
-                        config.name, original, config.replacement.replace(r"\1", "")
+                        config.name, value_key, config.replacement.replace(r"\1", "")
                     )
                 return self.get_unique_replacement(config.name, original, config.replacement)
             return config.pattern.sub(replacer, text)
