@@ -77,14 +77,22 @@ if not _is_worker_process():
         def browse_file(self):
             """Open file dialog to select a zip file."""
             file_types = ('Zip files (*.zip)', 'All files (*.*)')
+            # Start in the last-used directory, or Desktop to avoid
+            # slow directories like Downloads that may have many files.
+            start_dir = getattr(self, '_last_browse_dir', None)
+            if start_dir is None:
+                desktop = Path.home() / "Desktop"
+                start_dir = str(desktop if desktop.is_dir() else Path.home())
             result = self.window.create_file_dialog(
                 webview.OPEN_DIALOG,
+                directory=start_dir,
                 allow_multiple=False,
                 file_types=file_types
             )
 
             if result and len(result) > 0:
                 file_path = result[0]
+                self._last_browse_dir = str(Path(file_path).parent)
                 self._on_file_selected(file_path)
 
         def _on_file_selected(self, file_path: str):
