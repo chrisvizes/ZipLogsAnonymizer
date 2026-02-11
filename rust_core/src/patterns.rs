@@ -74,6 +74,17 @@ pub fn build_patterns() -> Vec<PatternConfig> {
             false,
         ),
 
+        // SQL queries - redact entire query (MULTILINE)
+        PatternConfig::new(
+            "sql_query",
+            r"(?m)^[ \t]*(?:SELECT|INSERT\s+INTO|UPDATE|DELETE(?:\s+FROM)?|WITH)\b[^\n]*(?:\n(?:[ \t]+\S[^\n]*|[)][^\n]*|(?:SELECT|FROM|WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|OFFSET|UNION|INTERSECT|EXCEPT|AND|OR|SET|VALUES|INTO|CASE|WHEN|THEN|ELSE|END|JOIN|LEFT|RIGHT|INNER|OUTER|CROSS|FULL|NATURAL|ON|AS)\b[^\n]*))*",
+            "QUERY_REDACTED",
+            false,
+            vec!["select ", "insert into", "update ", "delete "],
+            true,
+            true,
+        ),
+
         // Authorization headers
         PatternConfig::new(
             "auth_header",
@@ -290,13 +301,14 @@ pub fn build_patterns() -> Vec<PatternConfig> {
             false,
         ),
 
-        // Tableau-specific entities (key=value context)
+        // Tableau-specific entities (key=value and JSON contexts)
         PatternConfig::new(
             "tableau_entity",
-            r#"((?:site|workbook|datasource|project)\s*[=:]\s*)([^\s,;\\'"\}\]]+)"#,
+            r#"((?:site|workbook|datasource|project|vw|wb)\s*[=:]\s*)([^\s,;\\'"\}\]]+)|("(?:site|workbook|datasource|project|vw|wb)"\s*:\s*")([^"]+)"#,
             "${1}{UNIQUE}",
             true,
-            vec!["site=", "site:", "workbook", "datasource", "project"],
+            vec!["site=", "site:", "workbook", "datasource", "project",
+                 "\"site\"", "\"vw\"", "\"wb\"", "vw=", "vw:", "wb=", "wb:"],
             false,
             true,
         ),

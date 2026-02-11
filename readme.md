@@ -86,18 +86,26 @@ The following sensitive data patterns are detected and replaced:
 
 | Data Type | Detection Method | Example | Replacement |
 | --- | --- | --- | --- |
-| Site Names | `site=` context or `/t/SITE/` URL path | `site=CustomerPortal` or `/t/CustomerPortal/` | `site=entity001` or `/t/entity001/` |
-| Workbook Names | `workbook=` context or URL paths (`/vizql/w/`, `/views/`, `/authoring/`) | `/vizql/w/SalesReport/v/Overview/startSession` | `/vizql/w/entity002/v/entity003/startSession` |
-| View Names | URL paths (`/vizql/w/.../v/`, `/views/.../`, `/authoring/.../`) | `/views/SalesReport/Overview?:iid=1` | `/views/entity002/entity003?:iid=1` |
-| Datasource Names | `datasource=` context | `datasource=ProductionDB` | `datasource=entity004` |
-| Project Names | `project=` context | `project=Finance` | `project=entity005` |
+| Site Names | `site=`, `"site":"..."` JSON, or `/t/SITE/` URL path | `"site":"The Information Lab"` | `"site":"entity001"` |
+| Workbook Names | `workbook=`, `"wb":"..."` JSON, or URL paths (`/vizql/w/`, `/views/`, `/authoring/`) | `"wb":"DataSchoolPlacements"` | `"wb":"entity002"` |
+| View Names | `"vw":"..."` JSON or URL paths (`/vizql/w/.../v/`, `/views/.../`, `/authoring/.../`) | `"vw":"PlacementGanttDash"` | `"vw":"entity003"` |
+| Datasource Names | `datasource=` or `"datasource":"..."` JSON | `datasource=ProductionDB` | `datasource=entity004` |
+| Project Names | `project=` or `"project":"..."` JSON | `project=Finance` | `project=entity005` |
 
-URL path detection covers the most common Tableau Server URL structures:
+Detection covers key=value pairs, JSON structured log fields (`"site":"..."`, `"vw":"..."`, `"wb":"..."`), and URL paths:
 
 - `/vizql/w/WORKBOOK/v/VIEW/...` - VizQL rendering endpoints
 - `/views/WORKBOOK/VIEW?...` - Direct view URLs
 - `/authoring/WORKBOOK/VIEW?...` - Authoring mode URLs
 - `/t/SITE/...` - Multi-site URL prefix
+
+### Database Queries
+
+| Data Type | Detection Method | Example | Replacement |
+| --- | --- | --- | --- |
+| SQL Queries | `SELECT`, `INSERT INTO`, `UPDATE`, `DELETE`, `WITH` statements (multiline) | `SELECT "t1"."name" FROM "users"` | `QUERY_REDACTED` |
+
+SQL queries logged by Tableau's Hyper engine can contain sensitive data such as column names, table names, and string literals with personal information. Entire queries are replaced with `QUERY_REDACTED`.
 
 ### Consistency Guarantee
 

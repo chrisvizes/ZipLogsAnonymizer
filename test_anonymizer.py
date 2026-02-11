@@ -440,6 +440,103 @@ class TestSSNPattern:
         assert counts["ssn"] == 2
 
 
+class TestSQLQueryRedaction:
+    """Tests for SQL query detection and redaction."""
+
+    def test_single_line_select(self, matcher):
+        """Single-line SELECT should be redacted."""
+        content = 'SELECT "t1"."column_name" FROM "schema"."table_name" WHERE id = 1'
+        result, counts = anonymize_content(content, matcher)
+        assert "column_name" not in result
+        assert "table_name" not in result
+        assert "QUERY_REDACTED" in result
+        assert counts["sql_query"] == 1
+
+    def test_multiline_select(self, matcher):
+        """Multi-line SELECT with indented continuation should be fully redacted."""
+        content = (
+            'SELECT "t1"."name" AS "name",\n'
+            '  MAX("t1"."score") AS "max_score"\n'
+            'FROM (\n'
+            '  SELECT "t0"."name",\n'
+            '    "t0"."score"\n'
+            '  FROM "public"."students" "t0"\n'
+            ')\n'
+            'GROUP BY "t1"."name"'
+        )
+        result, counts = anonymize_content(content, matcher)
+        assert "students" not in result
+        assert "name" not in result or result == "QUERY_REDACTED"
+        assert "QUERY_REDACTED" in result
+        assert counts["sql_query"] == 1
+
+    def test_sql_with_sensitive_names(self, matcher):
+        """SQL containing person names in CASE/WHEN should be redacted."""
+        content = (
+            "SELECT CASE WHEN TABLEAU.CONTAINS(col,'gamble') "
+            "THEN 'Peter Gamble-Beresford' ELSE col END"
+        )
+        result, counts = anonymize_content(content, matcher)
+        assert "Peter Gamble-Beresford" not in result
+        assert "QUERY_REDACTED" in result
+
+    def test_sql_preserves_surrounding_content(self, matcher):
+        """Non-SQL content before/after a query should be preserved."""
+        content = (
+            "Log entry: query started\n"
+            'SELECT "t1"."col" FROM "table"\n'
+            "Log entry: query completed"
+        )
+        result, counts = anonymize_content(content, matcher)
+        assert "Log entry: query started" in result
+        assert "Log entry: query completed" in result
+        assert "QUERY_REDACTED" in result
+
+    def test_insert_into_redacted(self, matcher):
+        """INSERT INTO statements should be redacted."""
+        content = "INSERT INTO sensitive_table (name, email) VALUES ('John', 'john@test.com')"
+        result, counts = anonymize_content(content, matcher)
+        assert "sensitive_table" not in result
+        assert "QUERY_REDACTED" in result
+
+    def test_with_cte_redacted(self, matcher):
+        """WITH (CTE) statements should be redacted."""
+        content = (
+            'WITH cte AS (\n'
+            '  SELECT "name" FROM "users"\n'
+            ')\n'
+            'SELECT * FROM cte'
+        )
+        result, counts = anonymize_content(content, matcher)
+        assert "users" not in result
+        assert "QUERY_REDACTED" in result
+
+    def test_hyper_log_query(self, matcher):
+        """Realistic Hyper log SQL query should be fully redacted."""
+        content = (
+            'SELECT "t32"."ga:pagePath - Split 4" AS "ga:pagePath - Split 4",\n'
+            '  MAX((CASE WHEN ("t32"."$temp0_cse" = 0) THEN "t32"."value" END)) AS "max:col",\n'
+            '  SUM("t32"."ga:pageviews") AS "sum:ga:pageviews:ok"\n'
+            'FROM (\n'
+            '  SELECT "t31"."$temp5_cse" AS "$temp5_cse",\n'
+            '    "t31"."ga:date" AS "ga:date"\n'
+            '  FROM "extract"."Extract" "t31"\n'
+            ')'
+        )
+        result, counts = anonymize_content(content, matcher)
+        assert "ga:pagePath" not in result
+        assert "ga:pageviews" not in result
+        assert "Extract" not in result
+        assert "QUERY_REDACTED" in result
+
+    def test_non_sql_select_not_matched(self, matcher):
+        """Plain English with 'select' should not be redacted when no SQL context."""
+        content = "Please select an option from the menu"
+        result, counts = anonymize_content(content, matcher)
+        # This line starts with non-SQL text, "select" is mid-sentence
+        assert "option" in result
+
+
 class TestTableauEntityPattern:
     """Tests for Tableau-specific entity detection."""
 
@@ -579,6 +676,62 @@ class TestTableauEntityPattern:
         assert "Q4_Summary" not in result
         assert counts["tableau_entity"] >= 3
 
+    def test_json_site_name(self, matcher):
+        """JSON-formatted site name should be anonymized."""
+        content = '"site":"The Information Lab"'
+        result, counts = anonymize_content(content, matcher)
+        assert "The Information Lab" not in result
+        assert counts["tableau_entity"] == 1
+
+    def test_json_vw_key(self, matcher):
+        """JSON vw (view) abbreviation should be anonymized."""
+        content = '"vw":"PlacementGanttDash"'
+        result, counts = anonymize_content(content, matcher)
+        assert "PlacementGanttDash" not in result
+        assert counts["tableau_entity"] == 1
+
+    def test_json_wb_key(self, matcher):
+        """JSON wb (workbook) abbreviation should be anonymized."""
+        content = '"wb":"DataSchoolPlacements"'
+        result, counts = anonymize_content(content, matcher)
+        assert "DataSchoolPlacements" not in result
+        assert counts["tableau_entity"] == 1
+
+    def test_json_structured_log_line(self, matcher):
+        """Full structured JSON log line with site, vw, and wb should be fully anonymized."""
+        content = (
+            '{"ts":"2025-12-15T07:28:14.703","pid":115111,"tid":"1c41a","sev":"info",'
+            '"site":"The Information Lab","user":"tom.brown",'
+            '"ctx":{"vw":"PlacementGanttDash","wb":"DataSchoolPlacements"}}'
+        )
+        result, counts = anonymize_content(content, matcher)
+        assert "The Information Lab" not in result
+        assert "PlacementGanttDash" not in result
+        assert "DataSchoolPlacements" not in result
+        assert "tom.brown" not in result
+
+    def test_json_workbook_key(self, matcher):
+        """JSON-formatted workbook key should be anonymized."""
+        content = '"workbook":"SalesReport2024"'
+        result, counts = anonymize_content(content, matcher)
+        assert "SalesReport2024" not in result
+        assert counts["tableau_entity"] == 1
+
+    def test_json_site_with_spaces(self, matcher):
+        """JSON site name with spaces should be fully captured."""
+        content = '"site":"My Company Site Name"'
+        result, counts = anonymize_content(content, matcher)
+        assert "My Company Site Name" not in result
+        assert counts["tableau_entity"] == 1
+
+    def test_vw_wb_nonquoted_context(self, matcher):
+        """vw= and wb= in non-JSON context should also be anonymized."""
+        content = "vw=PlacementGanttDash wb=DataSchoolPlacements"
+        result, counts = anonymize_content(content, matcher)
+        assert "PlacementGanttDash" not in result
+        assert "DataSchoolPlacements" not in result
+        assert counts["tableau_entity"] == 2
+
 
 class TestProcessSingleFile:
     """Tests for the file processing function."""
@@ -662,45 +815,6 @@ Line 3: email=test@example.com"""
         result, counts = anonymize_content(content, matcher)
         assert "@example.com" not in result
         assert counts["email"] == 1000
-
-
-class TestPatternMatcherMethods:
-    """Tests for pattern matcher methods."""
-
-    @pytest.fixture
-    def opt_matcher(self):
-        from pattern_matcher import PatternMatcher
-        return PatternMatcher()
-
-    def test_content_may_have_matches_positive(self, opt_matcher):
-        """Content with keywords should return True."""
-        assert opt_matcher.content_may_have_matches("user=admin password=secret")
-        assert opt_matcher.content_may_have_matches("email: test@example.com")
-        assert opt_matcher.content_may_have_matches("Server=mydb.local")
-
-    def test_content_may_have_matches_negative(self, opt_matcher):
-        """Content without keywords should return False."""
-        assert not opt_matcher.content_may_have_matches("hello world")
-        assert not opt_matcher.content_may_have_matches("just some plain text")
-        assert not opt_matcher.content_may_have_matches("numbers 12345")
-
-    def test_get_applicable_patterns_filters(self, opt_matcher):
-        """Should only return patterns whose keywords match."""
-        # Line with password keyword
-        patterns = opt_matcher.get_applicable_patterns("password=secret")
-        pattern_names = [p.name for p in patterns]
-        assert "password" in pattern_names
-        assert "email" not in pattern_names
-
-        # Line with email indicator
-        patterns = opt_matcher.get_applicable_patterns("contact@example.com")
-        pattern_names = [p.name for p in patterns]
-        assert "email" in pattern_names
-
-    def test_get_applicable_patterns_empty_for_plain(self, opt_matcher):
-        """Plain text should have no applicable patterns."""
-        patterns = opt_matcher.get_applicable_patterns("hello world")
-        assert len(patterns) == 0
 
 
 class TestAnonymizationFunctions:
@@ -833,40 +947,6 @@ class TestAnonymizationConsistency:
         # Should redact sensitive data
         for sensitive in ["admin@company.local", "secret123", "192.168.1.50", "localhost:3306"]:
             assert sensitive not in result, f"Failed to redact: {sensitive}"
-
-
-class TestPreFilteringEffectiveness:
-    """Tests to verify pre-filtering reduces work."""
-
-    @pytest.fixture
-    def opt_matcher(self):
-        from pattern_matcher import PatternMatcher
-        return PatternMatcher()
-
-    def test_plain_text_no_patterns_applied(self, opt_matcher):
-        """Plain text should skip all pattern matching."""
-        lines = [
-            "This is plain text",
-            "No sensitive data here",
-            "Just regular log output",
-        ]
-        for line in lines:
-            applicable = opt_matcher.get_applicable_patterns(line)
-            assert len(applicable) == 0, f"Unexpected patterns for: {line}"
-
-    def test_keyword_filtering_reduces_patterns(self, opt_matcher):
-        """Lines with specific keywords should only match relevant patterns."""
-        # Password line should not trigger email pattern
-        pw_patterns = opt_matcher.get_applicable_patterns("password=test")
-        pw_names = [p.name for p in pw_patterns]
-        assert "password" in pw_names
-        assert "email" not in pw_names
-
-        # Email line should not trigger password pattern
-        email_patterns = opt_matcher.get_applicable_patterns("user@example.com")
-        email_names = [p.name for p in email_patterns]
-        assert "email" in email_names
-        assert "password" not in email_names
 
 
 class TestOutputIntegrity:

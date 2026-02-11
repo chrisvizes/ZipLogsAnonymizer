@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 """
-Pattern matching for sensitive data detection and anonymization.
+Pattern definitions for sensitive data detection and anonymization.
 
-OPTIMIZED VERSION - Key techniques:
-1. Pre-computed lowercase keywords with O(1) set lookups
-2. Single-pass keyword detection using set intersection
-3. Cached replacer functions (no function creation in hot loops)
-4. Use subn() instead of findall() + sub() to avoid double work
-5. Minimized string allocations and .lower() calls
-6. Batch line processing to reduce Python loop overhead
-7. High-performance Rust acceleration via PyO3 (5-15x faster)
+Patterns are defined here as Python dataclasses (source of truth).
+Actual matching is performed by the Rust core (anonymizer_core) using
+Aho-Corasick keyword pre-filtering and compiled regex.
 """
 
 import re
 from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import Optional, Callable
+from dataclasses import dataclass
+from typing import Optional
 
 # Import Rust core for high-performance processing (required at point of use).
 # Soft-fail at import time so auto-build has a chance to run first.
@@ -76,48 +71,19 @@ class PatternConfig:
     required_keywords: frozenset[str]
     # Whether this pattern can span multiple lines
     multiline: bool = False
-    # Pre-computed: keywords as a set for fast intersection
-    _keywords_set: set = field(default_factory=set, repr=False)
-
-    def __post_init__(self):
-        self._keywords_set = set(self.required_keywords)
 
 
 class PatternMatcher:
     """
-    High-performance pattern matcher using multiple optimization strategies.
+    Pattern definitions for sensitive data detection.
 
-    Optimizations:
-    - All keywords pre-lowercased at compile time
-    - Single set of all keywords for fast pre-filtering
-    - Keyword-to-pattern index for O(1) pattern lookup
-    - Replacer functions pre-created (not in hot loop)
+    Pattern definitions live here as the source of truth. Actual matching
+    is performed by the Rust core (anonymizer_core) using Aho-Corasick
+    keyword pre-filtering and compiled regex for 5-15x faster processing.
     """
 
     def __init__(self):
         self.patterns = self._compile_patterns()
-        # Pre-compute all keywords for fast content pre-filtering
-        self._all_keywords_lower = self._build_keyword_set()
-        # Build keyword -> patterns index for fast lookup
-        self._keyword_to_patterns = self._build_keyword_index()
-        # Pre-compute single-line patterns list
-        self._single_line_patterns = [p for p in self.patterns if not p.multiline]
-        self._multiline_patterns = [p for p in self.patterns if p.multiline]
-
-    def _build_keyword_set(self) -> frozenset[str]:
-        """Build unified lowercase keyword set for pre-filtering."""
-        keywords = set()
-        for config in self.patterns:
-            keywords.update(config.required_keywords)
-        return frozenset(keywords)
-
-    def _build_keyword_index(self) -> dict[str, list[PatternConfig]]:
-        """Build index from keyword -> list of patterns that use it."""
-        index = defaultdict(list)
-        for config in self.patterns:
-            for keyword in config.required_keywords:
-                index[keyword].append(config)
-        return dict(index)
 
     def _compile_patterns(self) -> list[PatternConfig]:
         """
@@ -152,6 +118,29 @@ class PatternMatcher:
                 replacement="CERTIFICATE_REDACTED",
                 uses_groups=False,
                 required_keywords=frozenset(["-----begin certificate"]),  # lowercase
+                multiline=True,
+            )
+        )
+
+        # SQL queries - redact entire query to prevent leaking sensitive
+        # data in column names, string literals, and table references (MULTILINE)
+        patterns.append(
+            PatternConfig(
+                name="sql_query",
+                pattern=re.compile(
+                    r'^[ \t]*(?:SELECT|INSERT\s+INTO|UPDATE|DELETE(?:\s+FROM)?|WITH)\b'
+                    r'[^\n]*'
+                    r'(?:\n(?:[ \t]+\S[^\n]*|[)][^\n]*|(?:SELECT|FROM|WHERE|GROUP\s+BY'
+                    r'|ORDER\s+BY|HAVING|LIMIT|OFFSET|UNION|INTERSECT|EXCEPT|AND|OR'
+                    r'|SET|VALUES|INTO|CASE|WHEN|THEN|ELSE|END|JOIN|LEFT|RIGHT|INNER'
+                    r'|OUTER|CROSS|FULL|NATURAL|ON|AS)\b[^\n]*))*',
+                    re.IGNORECASE | re.MULTILINE,
+                ),
+                replacement="QUERY_REDACTED",
+                uses_groups=False,
+                required_keywords=frozenset(
+                    ["select ", "insert into", "update ", "delete "]
+                ),
                 multiline=True,
             )
         )
@@ -409,57 +398,25 @@ class PatternMatcher:
             )
         )
 
-        # Tableau-specific entities (key=value context)
+        # Tableau-specific entities (key=value and JSON contexts)
         patterns.append(
             PatternConfig(
                 name="tableau_entity",
                 pattern=re.compile(
-                    r'((?:site|workbook|datasource|project)\s*[=:]\s*)([^\s,;\\\'"}\]]+)',
+                    r'((?:site|workbook|datasource|project|vw|wb)\s*[=:]\s*)([^\s,;\\\'"}\]]+)|'
+                    r'("(?:site|workbook|datasource|project|vw|wb)"\s*:\s*")([^"]+)',
                     re.IGNORECASE,
                 ),
                 replacement=r"\1{UNIQUE}",
                 uses_groups=True,
                 required_keywords=frozenset(
-                    ["site=", "site:", "workbook", "datasource", "project"]
+                    ["site=", "site:", "workbook", "datasource", "project",
+                     '"site"', '"vw"', '"wb"', "vw=", "vw:", "wb=", "wb:"]
                 ),
             )
         )
 
         return patterns
-
-    def content_may_have_matches(self, content: str) -> bool:
-        """
-        Fast pre-filter: check if content might contain any sensitive data.
-        Uses O(1) keyword lookups instead of regex.
-        """
-        content_lower = content.lower()
-        for keyword in self._all_keywords_lower:
-            if keyword in content_lower:
-                return True
-        return False
-
-    def get_applicable_patterns_fast(self, line_lower: str) -> list[PatternConfig]:
-        """
-        Return patterns whose required keywords appear in the line.
-        Expects pre-lowercased line to avoid redundant .lower() calls.
-        """
-        seen = set()
-        applicable = []
-        for keyword in self._all_keywords_lower:
-            if keyword in line_lower:
-                for pattern in self._keyword_to_patterns.get(keyword, []):
-                    if id(pattern) not in seen:
-                        seen.add(id(pattern))
-                        applicable.append(pattern)
-        return applicable
-
-    def get_applicable_patterns(self, line: str) -> list[PatternConfig]:
-        """
-        Return only patterns whose required keywords appear in the line.
-        This dramatically reduces regex executions.
-        """
-        return self.get_applicable_patterns_fast(line.lower())
-
 
 class FastAnonymizer:
     """
@@ -486,81 +443,6 @@ class FastAnonymizer:
                 self._rust_core.reset()
             except Exception:
                 pass
-
-    # Map categories to natural-looking replacement formats
-    # These formats are designed to be compatible with tools like LogShark
-    # that expect valid-looking usernames, hostnames, etc.
-    REPLACEMENT_FORMATS = {
-        "username": "user{idx:03d}",          # user001, user002 - looks like a real username
-        "email": "user{idx:03d}",             # user001@redacted.com - looks like real email
-        "hostname": "host{idx:03d}",          # host001.redacted - looks like real hostname
-        "internal_ip": "10.{idx}.0.1",        # 10.1.0.1, 10.2.0.1 - valid internal IP, unlikely to collide
-        "tableau_entity": "entity{idx:03d}",  # entity001 - generic entity name
-    }
-
-    def get_unique_replacement(self, category: str, original: str, template: str) -> str:
-        """Get consistent unique replacement for a value.
-
-        Uses natural-looking formats that are compatible with log analysis tools.
-        Same original value always maps to the same replacement.
-        """
-        if original not in self.unique_counters[category]:
-            self.unique_counters[category][original] = len(self.unique_counters[category]) + 1
-        idx = self.unique_counters[category][original]
-
-        # Use natural-looking format if available, otherwise fall back to default
-        if category in self.REPLACEMENT_FORMATS:
-            replacement = self.REPLACEMENT_FORMATS[category].format(idx=idx)
-            return template.replace("{UNIQUE}", replacement)
-        else:
-            return template.replace("{UNIQUE}", f"{category.upper()}_{idx:03d}")
-
-    def apply_pattern(self, config: PatternConfig, text: str) -> str:
-        """Apply a single pattern to text, tracking counts."""
-        if "{UNIQUE}" in config.replacement:
-            # Need custom replacer for unique values
-            def replacer(m):
-                original = m.group(0)
-                self.counts[config.name] += 1
-                if config.uses_groups and m.lastindex:
-                    # Find the first non-None group (handles alternation patterns
-                    # where different alternatives use different group numbers)
-                    prefix = ""
-                    for i in range(1, m.lastindex + 1):
-                        grp = m.group(i)
-                        if grp is not None:
-                            prefix = grp
-                            break
-                    # Use value portion (after prefix) as the unique key so the
-                    # same content name gets the same replacement across contexts
-                    value_key = original[len(prefix):] if prefix else original
-                    return prefix + self.get_unique_replacement(
-                        config.name, value_key, config.replacement.replace(r"\1", "")
-                    )
-                return self.get_unique_replacement(config.name, original, config.replacement)
-            return config.pattern.sub(replacer, text)
-
-        elif config.uses_groups:
-            def replacer(m):
-                self.counts[config.name] += 1
-                result = config.replacement
-                # Find the first non-None group and substitute it for \1
-                # (handles alternation patterns where the prefix may be
-                # in group 1, 3, 5, etc. depending on which alternative matched)
-                for i in range(1, (m.lastindex or 0) + 1):
-                    grp = m.group(i)
-                    if grp is not None:
-                        result = result.replace(r"\1", grp)
-                        break
-                return result
-            return config.pattern.sub(replacer, text)
-
-        else:
-            # Simple replacement - use subn for count + replace in one pass
-            new_text, count = config.pattern.subn(config.replacement, text)
-            if count:
-                self.counts[config.name] += count
-            return new_text
 
     def process_content(self, content: str, full_reset: bool = True) -> tuple[str, dict[str, int]]:
         """Process content using high-performance Rust engine.

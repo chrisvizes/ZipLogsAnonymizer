@@ -18,8 +18,6 @@ Performance targets based on 20-minute goal for 14GB uncompressed:
 
 import time
 import random
-import string
-from io import StringIO
 import pytest
 
 from pattern_matcher import PatternMatcher, FastAnonymizer, anonymize_content
@@ -136,16 +134,6 @@ def estimate_content_size_mb(content: str) -> float:
 # Values are set conservatively to catch major regressions.
 
 THRESHOLDS = {
-    # Keyword detection: how many lines/sec can we check for keywords?
-    # Baseline: ~5M lines/sec (very fast due to simple string lookups)
-    # Minimum acceptable: 1M lines/sec (catch major regressions)
-    "keyword_detection_lines_per_sec": 1_000_000,
-
-    # Pattern matching: how fast can we process lines that HAVE sensitive data?
-    # Baseline: ~80K lines/sec for lines requiring regex
-    # Minimum acceptable: 40K lines/sec
-    "pattern_matching_lines_per_sec": 40_000,
-
     # Full pipeline: end-to-end throughput for mixed content (5% sensitive)
     # Baseline: ~7 MB/s
     # Minimum acceptable: 5 MB/s (catch 30% regressions)
@@ -155,16 +143,6 @@ THRESHOLDS = {
     # Baseline: ~8 MB/s (still checks every line for keywords)
     # Minimum acceptable: 6 MB/s
     "clean_content_mb_per_sec": 6.0,
-
-    # High sensitive content (50% sensitive lines)
-    # Baseline: ~6 MB/s
-    # Minimum acceptable: 4 MB/s
-    "high_sensitive_mb_per_sec": 4.0,
-
-    # Lines per second for full processing
-    # Baseline: ~115K lines/sec
-    # Minimum acceptable: 80K lines/sec
-    "full_pipeline_lines_per_sec": 80_000,
 
     # Sparse content (only 0.1% sensitive): should be close to clean content speed
     # Baseline: ~7 MB/s
@@ -181,13 +159,6 @@ THRESHOLDS = {
 def matcher():
     """Shared pattern matcher instance."""
     return PatternMatcher()
-
-
-@pytest.fixture(scope="module")
-def small_content():
-    """Small test content: 10,000 lines (~1MB)."""
-    random.seed(42)  # Reproducible
-    return generate_test_content(10_000, sensitive_ratio=0.05)
 
 
 @pytest.fixture(scope="module")
@@ -209,142 +180,6 @@ def high_sensitive_content():
     """Content with high ratio of sensitive data (stress test)."""
     random.seed(42)
     return generate_test_content(10_000, sensitive_ratio=0.50)
-
-
-# =============================================================================
-# KEYWORD DETECTION TESTS
-# =============================================================================
-
-class TestKeywordDetection:
-    """Test performance of keyword pre-filtering."""
-
-    def test_keyword_check_throughput(self, matcher, small_content):
-        """Verify keyword detection can process 200K+ lines/sec."""
-        lines = small_content.split("\n")
-        all_keywords = matcher._all_keywords_lower
-
-        # Warm up
-        for line in lines[:100]:
-            line_lower = line.lower()
-            any(kw in line_lower for kw in all_keywords)
-
-        # Benchmark
-        start = time.perf_counter()
-        iterations = 3
-        for _ in range(iterations):
-            for line in lines:
-                line_lower = line.lower()
-                # This is the hot path we're testing
-                has_keyword = False
-                for kw in all_keywords:
-                    if kw in line_lower:
-                        has_keyword = True
-                        break
-
-        elapsed = time.perf_counter() - start
-        total_lines = len(lines) * iterations
-        lines_per_sec = total_lines / elapsed
-
-        print(f"\nKeyword detection: {lines_per_sec:,.0f} lines/sec")
-        assert lines_per_sec >= THRESHOLDS["keyword_detection_lines_per_sec"], \
-            f"Keyword detection too slow: {lines_per_sec:,.0f} < {THRESHOLDS['keyword_detection_lines_per_sec']:,}"
-
-    def test_keyword_check_early_exit(self, matcher):
-        """Verify early exit optimization works (line with keyword at start)."""
-        all_keywords = matcher._all_keywords_lower
-
-        # Line with keyword early
-        line_with_keyword = "password=secret and other stuff " * 10
-        line_lower = line_with_keyword.lower()
-
-        start = time.perf_counter()
-        for _ in range(100_000):
-            for kw in all_keywords:
-                if kw in line_lower:
-                    break
-        elapsed = time.perf_counter() - start
-
-        # Should be fast due to early exit
-        ops_per_sec = 100_000 / elapsed
-        print(f"\nEarly exit keyword check: {ops_per_sec:,.0f} ops/sec")
-        assert ops_per_sec > 100_000, "Early exit not working effectively"
-
-
-# =============================================================================
-# PATTERN MATCHING TESTS
-# =============================================================================
-
-class TestPatternMatching:
-    """Test performance of regex pattern matching."""
-
-    def test_single_pattern_throughput(self, matcher):
-        """Test throughput of individual pattern types."""
-        # Lines that will match specific patterns
-        test_cases = {
-            "email": "Contact user at john.doe@company.com for support",
-            "internal_ip": "Server 192.168.1.100 responded with status 200",
-            "password": "Login with password=supersecret123",
-            "hostname": "Connected to server.corp successfully",
-        }
-
-        anonymizer = FastAnonymizer(matcher)
-        results = {}
-
-        for pattern_name, test_line in test_cases.items():
-            # Find the pattern
-            patterns = [p for p in matcher.patterns if p.name == pattern_name]
-            if not patterns:
-                continue
-            pattern = patterns[0]
-
-            # Benchmark
-            start = time.perf_counter()
-            iterations = 10_000
-            for _ in range(iterations):
-                anonymizer.apply_pattern(pattern, test_line)
-            elapsed = time.perf_counter() - start
-
-            ops_per_sec = iterations / elapsed
-            results[pattern_name] = ops_per_sec
-            print(f"\n{pattern_name} pattern: {ops_per_sec:,.0f} matches/sec")
-
-        # All patterns should achieve reasonable throughput
-        for name, throughput in results.items():
-            assert throughput > 10_000, f"{name} pattern too slow: {throughput:,.0f}/sec"
-
-    def test_lines_with_patterns_throughput(self, matcher, high_sensitive_content):
-        """Test processing lines that actually contain sensitive data."""
-        lines = high_sensitive_content.split("\n")
-        keyword_to_patterns = matcher._keyword_to_patterns
-        all_keywords = matcher._all_keywords_lower
-
-        # Filter to only lines with keywords
-        sensitive_lines = []
-        for line in lines:
-            line_lower = line.lower()
-            if any(kw in line_lower for kw in all_keywords):
-                sensitive_lines.append(line)
-
-        if not sensitive_lines:
-            pytest.skip("No sensitive lines found")
-
-        anonymizer = FastAnonymizer(matcher)
-
-        # Benchmark processing sensitive lines
-        start = time.perf_counter()
-        for line in sensitive_lines:
-            line_lower = line.lower()
-            for kw in all_keywords:
-                if kw in line_lower:
-                    for pattern in keyword_to_patterns.get(kw, []):
-                        if not pattern.multiline:
-                            anonymizer.apply_pattern(pattern, line)
-        elapsed = time.perf_counter() - start
-
-        lines_per_sec = len(sensitive_lines) / elapsed
-        print(f"\nSensitive line processing: {lines_per_sec:,.0f} lines/sec")
-        assert lines_per_sec >= THRESHOLDS["pattern_matching_lines_per_sec"], \
-            f"Pattern matching too slow: {lines_per_sec:,.0f} < {THRESHOLDS['pattern_matching_lines_per_sec']:,}"
 
 
 # =============================================================================
